@@ -106,6 +106,19 @@ function init() {
     // Events
     window.addEventListener('resize', onWindowResize);
     
+    // About modal
+    document.getElementById('about-btn').addEventListener('click', () => {
+        document.getElementById('about-overlay').classList.remove('hidden');
+    });
+    document.getElementById('about-close').addEventListener('click', () => {
+        document.getElementById('about-overlay').classList.add('hidden');
+    });
+    document.getElementById('about-overlay').addEventListener('click', (e) => {
+        if (e.target.id === 'about-overlay') {
+            document.getElementById('about-overlay').classList.add('hidden');
+        }
+    });
+    
     // Auto-connect to Tailscale endpoint
     connectWebSocket(CONFIG.WS_URL);
     
@@ -138,6 +151,10 @@ function createFloor() {
 
 function createPanels() {
     // Create all 12 panels (4 units × 3 panels each)
+    const PANEL_DEPTH = 1.5; // Box depth in cm
+    const FRAME_WIDTH = 4; // Frame border width in cm
+    const INNER_SIZE = CONFIG.PANEL_SIZE - (FRAME_WIDTH * 2); // Lit area size
+    
     for (let unit = 0; unit < 4; unit++) {
         const unitX = unit * CONFIG.UNIT_SPACING;
         
@@ -145,29 +162,42 @@ function createPanels() {
             const [localY, localZ] = CONFIG.PANEL_LOCAL_POSITIONS[panelNum];
             const angle = CONFIG.PANEL_ANGLES[panelNum];
             
-            // Panel geometry
-            const panelGeom = new THREE.PlaneGeometry(CONFIG.PANEL_SIZE, CONFIG.PANEL_SIZE);
-            const panelMat = new THREE.MeshBasicMaterial({
-                color: 0x333333,
-                side: THREE.DoubleSide,
-                transparent: true,
+            // Create a group to hold frame and lit area
+            const panelGroup = new THREE.Group();
+            panelGroup.position.set(unitX, localY, localZ);
+            panelGroup.rotation.x = THREE.MathUtils.degToRad(-angle);
+            
+            // Frame (outer box) - stays dark
+            const frameGeom = new THREE.BoxGeometry(CONFIG.PANEL_SIZE, CONFIG.PANEL_SIZE, PANEL_DEPTH);
+            const frameMat = new THREE.MeshBasicMaterial({
+                color: 0x2a2a2f,
             });
+            const frame = new THREE.Mesh(frameGeom, frameMat);
+            panelGroup.add(frame);
             
-            const panel = new THREE.Mesh(panelGeom, panelMat);
-            panel.position.set(unitX, localY, localZ);
-            panel.rotation.x = THREE.MathUtils.degToRad(-angle);
-            
-            // Add thin border
-            const edges = new THREE.EdgesGeometry(panelGeom);
+            // Add wireframe edges to frame
+            const edges = new THREE.EdgesGeometry(frameGeom);
             const line = new THREE.LineSegments(
                 edges,
-                new THREE.LineBasicMaterial({ color: 0x444455, linewidth: 1 })
+                new THREE.LineBasicMaterial({ color: 0x333344, linewidth: 1 })
             );
-            panel.add(line);
+            frame.add(line);
             
-            scene.add(panel);
+            // Lit area (inner plane on front face)
+            const litGeom = new THREE.PlaneGeometry(INNER_SIZE, INNER_SIZE);
+            const litMat = new THREE.MeshBasicMaterial({
+                color: 0x333333,
+                transparent: true,
+            });
+            const litArea = new THREE.Mesh(litGeom, litMat);
+            litArea.position.z = PANEL_DEPTH / 2 + 0.1; // Slightly in front of frame
+            panelGroup.add(litArea);
+            
+            scene.add(panelGroup);
             panels.push({
-                mesh: panel,
+                mesh: litArea, // The lit area is what changes brightness
+                frame: frame,
+                group: panelGroup,
                 unit: unit,
                 panelNum: panelNum,
                 brightness: 0,
@@ -293,12 +323,22 @@ function handleStateUpdate(data) {
     }
     
     // Update panel brightness
+    // DMX values from Python are in range 1-50 (DMX_MIN to DMX_MAX)
+    // Python sends units in reverse order (unit 3,2,1,0), so reverse to match viewer order
     if (data.panels) {
-        data.panels.forEach((brightness, index) => {
+        const reversedPanels = [...data.panels].reverse();
+        reversedPanels.forEach((dmxValue, index) => {
             if (panels[index]) {
-                const normalizedBrightness = brightness / 255; // DMX max 255
-                const gray = 0.15 + normalizedBrightness * 0.85;
-                panels[index].mesh.material.color.setRGB(gray, gray, gray * 0.95);
+                const normalizedBrightness = (dmxValue - 1) / 49; // Map 1-50 to 0-1
+                // Apply exponential curve for more dramatic effect (brights pop more)
+                const curved = Math.pow(normalizedBrightness, 0.6);
+                // Very dark minimum (0.03) to over-bright (1.2) with warm tint
+                const intensity = 0.03 + curved * 1.17;
+                panels[index].mesh.material.color.setRGB(
+                    Math.min(intensity, 1.0), 
+                    Math.min(intensity * 0.95, 1.0), 
+                    Math.min(intensity * 0.85, 1.0)
+                );
                 panels[index].brightness = normalizedBrightness;
             }
         });

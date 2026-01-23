@@ -26,6 +26,28 @@
         <span id="mode-label"></span>
     </div>
 
+    <button id="about-btn">About</button>
+    <a id="github-btn" href="https://github.com/npuckett/Drop-Ceiling" target="_blank">GitHub</a>
+
+    <div id="about-overlay" class="hidden">
+        <div id="about-modal">
+            <button id="about-close">&times;</button>
+            <h2>Drop Ceiling</h2>
+            <div class="about-content">
+                <p>'Drop Ceiling' implements an open-source hardware and software system to transform ubiquitous office lighting into an interactive installation. It responds to the movement and position of people on the sidewalk using a Computer Vision system created from an array of standard security cameras. The installation showcases new methods of playful re-use via open data protocols.</p>
+                
+                <p>Each lighting unit is constructed from three 2 ft × 2ft LED ceiling lights that are connected via 3D printed connectors. A custom hardware controller dynamically adjusts the brightness of each panel by interfacing with its standard 0 – 10V dimming protocol. All four of the units are networked together to allow them to uniformly respond to the position information from the Computer Vision system. The vision system utilizes the standard Real Time Streaming Protocol (RTSP) available in security cameras to create a custom tracking model that is focused on data privacy. Over time, the panels will develop an animated language to communicate with passers-by throughout the day and night.</p>
+                
+                <p>This work is the latest in a research series from <a href="https://puckettrand.com/" target="_blank">Puckett Research & Design</a> that investigates how contemporary forms of Machine Vision can be re-purposed for playful interactions. All control software and design files are available via the <a href="https://github.com/npuckett/Drop-Ceiling" target="_blank">Drop Ceiling Github</a>.</p>
+                
+                <div class="design-team">
+                    <h3>Design Team</h3>
+                    <p>Nick Puckett<br>Joshua Pothen</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script type="importmap">
     {
         "imports": {
