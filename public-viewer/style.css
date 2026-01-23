@@ -178,11 +178,21 @@ html, body {
 }
 
 #about-btn {
-    top: 20px;
+    top: 120px;
 }
 
 #github-btn {
-    top: 58px;
+    top: 158px;
+}
+
+/* Move buttons up on larger screens */
+@media (min-width: 768px) {
+    #about-btn {
+        top: 20px;
+    }
+    #github-btn {
+        top: 58px;
+    }
 }
 
 #about-btn:hover,
