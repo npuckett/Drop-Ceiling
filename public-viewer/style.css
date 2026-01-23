@@ -47,6 +47,17 @@ html, body {
     opacity: 0.9;
 }
 
+#behavior-status {
+    font-size: 14px;
+    font-weight: 300;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    color: var(--text-color);
+    opacity: 0.6;
+    margin-top: 8px;
+    min-height: 20px;
+}
+
 /* 3D Container */
 #container {
     width: 100%;

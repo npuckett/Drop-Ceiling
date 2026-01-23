@@ -351,7 +351,12 @@ function handleStateUpdate(data) {
     
     // Update mode display
     if (data.mode) {
-        updateModeDisplay(data.mode, data.status_text);
+        updateModeDisplay(data.mode, data.status);
+    }
+    
+    // Update behavior status text
+    if (data.status !== undefined) {
+        document.getElementById('behavior-status').textContent = data.status || '';
     }
 }
 
