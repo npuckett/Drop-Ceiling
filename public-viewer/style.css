@@ -177,6 +177,7 @@ html, body {
     text-decoration: none;
 }
 
+/* Default position - below header for mobile portrait */
 #about-btn {
     top: 120px;
 }
@@ -185,20 +186,20 @@ html, body {
     top: 158px;
 }
 
-/* Move buttons up on larger screens */
-@media (min-width: 768px) {
+#about-btn:hover,
+#github-btn:hover {
+    color: var(--text-color);
+    border-color: rgba(255, 255, 255, 0.3);
+}
+
+/* Move buttons to top-right on landscape or wide screens */
+@media (min-width: 768px), (orientation: landscape) {
     #about-btn {
         top: 20px;
     }
     #github-btn {
         top: 58px;
     }
-}
-
-#about-btn:hover,
-#github-btn:hover {
-    color: var(--text-color);
-    border-color: rgba(255, 255, 255, 0.3);
 }
 
 /* About overlay */
