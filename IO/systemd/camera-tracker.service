@@ -1,0 +1,50 @@
+# Drop Ceiling - Camera Tracker Service
+# Tracks people via YOLO and sends positions over OSC
+#
+# Install: sudo cp camera-tracker.service /etc/systemd/system/
+# Enable:  sudo systemctl enable camera-tracker
+# Start:   sudo systemctl start camera-tracker
+# Logs:    journalctl -u camera-tracker -f
+
+[Unit]
+Description=Drop Ceiling Camera Tracker (YOLO + OSC)
+After=network.target
+# Start after network is available (for RTSP cameras)
+Wants=network-online.target
+# Don't restart more than 5 times in 60 seconds (prevents crash loops)
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=nick
+Group=nick
+WorkingDirectory=/home/nick/Documents/Github/dc-dev/IO
+
+# Environment setup
+Environment="PATH=/home/nick/Documents/Github/dc-dev/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+Environment="DISPLAY=:0"
+
+# Run in headless mode for production
+Environment="HEADLESS=1"
+
+# The command to run
+ExecStart=/home/nick/Documents/Github/dc-dev/.venv/bin/python camera_tracker_osc.py
+
+# Restart policy - always restart on failure
+Restart=always
+RestartSec=5
+
+# Resource limits
+Nice=-5
+# Allow GPU access
+SupplementaryGroups=video render
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=camera-tracker
+
+[Install]
+WantedBy=multi-user.target

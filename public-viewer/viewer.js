@@ -4,6 +4,7 @@
  */
 
 import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
 // =============================================================================
 // CONFIGURATION (matching Python controller)
@@ -48,7 +49,7 @@ const CONFIG = {
 // STATE
 // =============================================================================
 
-let scene, camera, renderer;
+let scene, camera, renderer, controls;
 let panels = [];
 let lightSphere, lightGlow, falloffSphere;
 let trackedPeople = {};
@@ -68,10 +69,10 @@ function init() {
     // Camera - fixed position for mobile portrait view
     camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 1, 2000);
     
-    // Position camera for a good view of the panels
-    // Looking from front-right, slightly above
-    camera.position.set(300, 200, 350);
-    camera.lookAt(120, 60, 0);
+    // Position camera for a good view of panels and tracking area
+    // Looking from front-right side, further back to see people
+    camera.position.set(450, 250, 400);
+    camera.lookAt(120, 80, 100);
     
     // Renderer
     const canvas = document.getElementById('viewer');
@@ -82,6 +83,15 @@ function init() {
     });
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    
+    // Orbit controls - allows user to rotate/pan/zoom camera
+    controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(120, 60, 80);  // Look at center of scene
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.minDistance = 100;
+    controls.maxDistance = 1500;
+    controls.update();
     
     // Lighting
     const ambientLight = new THREE.AmbientLight(0x222233, 0.5);
@@ -286,7 +296,7 @@ function handleStateUpdate(data) {
     if (data.panels) {
         data.panels.forEach((brightness, index) => {
             if (panels[index]) {
-                const normalizedBrightness = brightness / 50; // DMX max ~50
+                const normalizedBrightness = brightness / 255; // DMX max 255
                 const gray = 0.15 + normalizedBrightness * 0.85;
                 panels[index].mesh.material.color.setRGB(gray, gray, gray * 0.95);
                 panels[index].brightness = normalizedBrightness;
@@ -366,11 +376,8 @@ function updateModeDisplay(mode, statusText) {
 function animate() {
     requestAnimationFrame(animate);
     
-    // Subtle camera sway for life
-    const time = Date.now() * 0.0001;
-    camera.position.x = 300 + Math.sin(time) * 5;
-    camera.position.y = 200 + Math.sin(time * 0.7) * 3;
-    camera.lookAt(120, 60, 0);
+    // Update orbit controls
+    controls.update();
     
     // Pulse the light glow slightly
     if (lightGlow && currentState?.light) {
