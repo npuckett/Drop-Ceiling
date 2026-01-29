@@ -44,6 +44,10 @@ To translate these 2D pixel coordinates into a shared 3D world coordinate system
 
 Because the two cameras have overlapping fields of view, their detections must be reconciled. The system uses spatial proximity matching: when two cameras detect people in the same region, detections within a configurable distance threshold are merged into a single tracked individual. Each camera's contribution is weighted by detection confidence and viewing angle. The result is a unified coordinate stream with X/Z positions in centimeters, updated at approximately 15–20Hz depending on network conditions and processing load.
 
+| ![Marker 0](calibration/marker_0.png) | ![Marker 1](calibration/marker_1.png) | ![Marker 2](calibration/marker_2.png) | ![Marker 3](calibration/marker_3.png) | ![Marker 4](calibration/marker_4.png) | ![Marker 5](calibration/marker_5.png) | ![Marker 6](calibration/marker_6.png) |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| Marker 0 | Marker 1 | Marker 2 | Marker 3 | Marker 4 | Marker 5 | Marker 6 |
+
 ### Output
 
 #### DMX over Art-Net
