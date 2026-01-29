@@ -1,6 +1,6 @@
 ![Drop Ceiling Front View](images/dropCeiling-frontView.jpg)
 
-## [View Live Installation → www.thedropceiling.com](https://www.thedropceiling.com)
+## [View Live Installation → thedropceiling.com](https://thedropceiling.com)
 
 # Drop Ceiling
 'Drop Ceiling' implements an open-source hardware and software system to transform ubiquitous office lighting into an interactive installation. It responds to the movement and position of people on the sidewalk using a Computer Vision system created from an array of standard security cameras. The installation showcases new methods of playful re-use via open data protocols.
