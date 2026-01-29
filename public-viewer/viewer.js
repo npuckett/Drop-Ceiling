@@ -85,8 +85,8 @@ function init() {
     // Position camera for a good view of panels and tracking area
     // Looking from front-right side, further back to see people
     // Units are at negative X (-30 to -270), so position camera to see that area
-    camera.position.set(200, 250, 400);
-    camera.lookAt(-150, 80, 50);
+    camera.position.set(200, 250, 450);
+    camera.lookAt(-150, 80, 120);
     
     // Renderer
     const canvas = document.getElementById('viewer');
@@ -100,7 +100,7 @@ function init() {
     
     // Orbit controls - allows user to rotate/pan/zoom camera
     controls = new OrbitControls(camera, renderer.domElement);
-    controls.target.set(-150, 60, 50);  // Look at center of units (negative X)
+    controls.target.set(-150, 60, 120);  // Look at center of tracking zones
     controls.enableDamping = true;
     controls.dampingFactor = 0.05;
     controls.minDistance = 100;
@@ -476,9 +476,9 @@ function createPersonMesh() {
     // Simple cylinder for body
     const bodyGeom = new THREE.CylinderGeometry(15, 15, 150, 12);
     const bodyMat = new THREE.MeshBasicMaterial({ 
-        color: 0x44aa66,
+        color: 0x66ee88,
         transparent: true,
-        opacity: 0.6,
+        opacity: 0.85,
     });
     const body = new THREE.Mesh(bodyGeom, bodyMat);
     group.add(body);
