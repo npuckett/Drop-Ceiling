@@ -5,7 +5,26 @@
 
 Each lighting unit is constructed from three 2 ft × 2ft LED ceiling lights that are connected via 3D printed connectors. A custom hardware controller dynamically adjusts the brightness of each panel by interfacing with its standard 0 – 10V dimming protocol. All four of the units are networked together to allow them to uniformly respond to the position information from the Computer Vision system. The vision system utilizes the standard Real Time Streaming Protocol (RTSP) available in security cameras to create a custom tracking model that is focused on data privacy. Over time, the panels will develop an animated language to communicate with passers-by throughout the day and night.
 
-**Drop Ceiling** 
+
+## Protocols
+
+### Input
+
+#### RTSP Camera Feeds
+The system uses standard PoE security cameras. While these are often designed to work with proprietary NVRs, many also have the ability to broadcast using the standard [Real Time Streaming Protocol (RTSP)](https://en.wikipedia.org/wiki/Real_Time_Streaming_Protocol). This open protocol can be read by most any programming language. Drop Ceiling uses 2 [Reolink RLC-520A](https://reolink.com/product/rlc-520a/) cameras. These were chosen for their good low-light performance, wide field of view, and decent framerate. Others have higher resolution, but this isn't useful for tracking.
+
+#### Synthesis and Calibration
+The feeds are processed first using [YOLOv11](https://docs.ultralytics.com/), a real-time object detection model optimized for identifying people in the frame. Each camera produces independent 2D detections with bounding boxes and confidence scores.
+
+To translate these 2D pixel coordinates into a shared 3D world coordinate system, the installation uses [ArUco markers](https://docs.opencv.org/4.x/d5/dae/tutorial_aruco_detection.html)—square fiducial markers from the OpenCV library that encode unique IDs in their black and white patterns. Four markers are placed at known positions in the physical space, typically on the floor at measured distances. During calibration, each camera detects these markers and computes a homography matrix that maps its 2D image plane to the real-world ground plane.
+
+Because the two cameras have overlapping fields of view, their detections must be reconciled. The system uses spatial proximity matching: when two cameras detect people in the same region, detections within a configurable distance threshold are merged into a single tracked individual. Each camera's contribution is weighted by detection confidence and viewing angle. The result is a unified coordinate stream with X/Z positions in centimeters, updated at approximately 15–20Hz depending on network conditions and processing load.
+
+### Output
+
+#### DMX over Art-Net
+The brightness of each LED panel is sent in real-time as DMX data over the [Art-Net protocol](https://art-net.org.uk/). A standard DMX decoder receives the signals and a voltage divider circuit converts the 0–12V PWM signal into the standard 0–10V dimming protocol used by most LED ceiling panels.
+
 ## Operating Software
 This repo contains all source code for Drop Ceiling. This includes: Calibration software and methods, Computer Vision tracking system, Lighting control software, and 3D printing files. 
 
