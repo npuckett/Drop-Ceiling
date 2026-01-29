@@ -133,28 +133,33 @@ function init() {
         }
     });
     
-    // Trends panel toggle
+    // Trends panel toggle (elements may be commented out in HTML)
     const trendsPanel = document.getElementById('trends-panel');
     const trendsBtn = document.getElementById('trends-btn');
     const trendsHeader = document.getElementById('trends-header');
     
-    // Start hidden
-    trendsPanel.classList.add('hidden');
-    
-    trendsBtn.addEventListener('click', () => {
-        if (trendsPanel.classList.contains('hidden')) {
-            trendsPanel.classList.remove('hidden');
-            trendsPanel.classList.remove('collapsed');
-            // Refresh the display with latest data when opening
-            updateTrendsDisplay(latestDailyReport, latestRealtimeTrends);
-        } else {
-            trendsPanel.classList.add('hidden');
+    // Only set up trends panel if elements exist
+    if (trendsPanel && trendsBtn) {
+        // Start hidden
+        trendsPanel.classList.add('hidden');
+        
+        trendsBtn.addEventListener('click', () => {
+            if (trendsPanel.classList.contains('hidden')) {
+                trendsPanel.classList.remove('hidden');
+                trendsPanel.classList.remove('collapsed');
+                // Refresh the display with latest data when opening
+                updateTrendsDisplay(latestDailyReport, latestRealtimeTrends);
+            } else {
+                trendsPanel.classList.add('hidden');
+            }
+        });
+        
+        if (trendsHeader) {
+            trendsHeader.addEventListener('click', () => {
+                trendsPanel.classList.toggle('collapsed');
+            });
         }
-    });
-    
-    trendsHeader.addEventListener('click', () => {
-        trendsPanel.classList.toggle('collapsed');
-    });
+    }
     
     // Auto-connect to Tailscale endpoint
     connectWebSocket(CONFIG.WS_URL);
@@ -381,10 +386,10 @@ function handleStateUpdate(data) {
     
     // Update panel brightness
     // DMX values from Python are in range 1-50 (DMX_MIN to DMX_MAX)
-    // Python sends units in reverse order (unit 3,2,1,0), so reverse to match viewer order
+    // Python sends panels in order: Unit 0 (panels 1-3), Unit 1 (panels 1-3), etc.
+    // This matches the order panels are created in createPanels()
     if (data.panels) {
-        const reversedPanels = [...data.panels].reverse();
-        reversedPanels.forEach((dmxValue, index) => {
+        data.panels.forEach((dmxValue, index) => {
             if (panels[index]) {
                 const normalizedBrightness = (dmxValue - 1) / 49; // Map 1-50 to 0-1
                 // Apply exponential curve for more dramatic effect (brights pop more)
@@ -531,68 +536,76 @@ function updateTrendsDisplay(report, realtime) {
 }
 
 function updateRealtimeSection(realtime) {
+    // Check if realtime elements exist (they may be commented out in HTML)
+    const periodEl = document.getElementById('stat-period');
+    if (!periodEl) return; // Elements not in DOM, skip update
+    
     if (!realtime) {
         // No realtime data - show placeholders
-        document.getElementById('stat-period').textContent = '--';
-        document.getElementById('stat-1m-active').textContent = '-';
-        document.getElementById('stat-1m-passive').textContent = '-';
-        document.getElementById('stat-5m-active').textContent = '-';
-        document.getElementById('stat-5m-passive').textContent = '-';
-        document.getElementById('stat-15m-active').textContent = '-';
-        document.getElementById('stat-15m-passive').textContent = '-';
-        document.getElementById('stat-60m-active').textContent = '-';
-        document.getElementById('stat-60m-passive').textContent = '-';
+        periodEl.textContent = '--';
+        const els = ['stat-1m-active', 'stat-1m-passive', 'stat-5m-active', 'stat-5m-passive', 
+                     'stat-15m-active', 'stat-15m-passive', 'stat-60m-active', 'stat-60m-passive'];
+        els.forEach(id => { const el = document.getElementById(id); if (el) el.textContent = '-'; });
         return;
     }
     
     // Period
     const period = realtime.period || 'unknown';
     const periodDisplay = period.replace('_', ' ').toUpperCase();
-    document.getElementById('stat-period').textContent = periodDisplay;
+    periodEl.textContent = periodDisplay;
+    
+    // Helper to safely set text content
+    const setText = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
     
     // 1 minute (recent)
     if (realtime.recent?.available) {
-        document.getElementById('stat-1m-active').textContent = realtime.recent.active || 0;
-        document.getElementById('stat-1m-passive').textContent = realtime.recent.passive || 0;
+        setText('stat-1m-active', realtime.recent.active || 0);
+        setText('stat-1m-passive', realtime.recent.passive || 0);
     } else {
-        document.getElementById('stat-1m-active').textContent = '-';
-        document.getElementById('stat-1m-passive').textContent = '-';
+        setText('stat-1m-active', '-');
+        setText('stat-1m-passive', '-');
     }
     
     // 5 minute (short)
     if (realtime.short?.available) {
-        document.getElementById('stat-5m-active').textContent = realtime.short.active || 0;
-        document.getElementById('stat-5m-passive').textContent = realtime.short.passive || 0;
+        setText('stat-5m-active', realtime.short.active || 0);
+        setText('stat-5m-passive', realtime.short.passive || 0);
     } else {
-        document.getElementById('stat-5m-active').textContent = '-';
-        document.getElementById('stat-5m-passive').textContent = '-';
+        setText('stat-5m-active', '-');
+        setText('stat-5m-passive', '-');
     }
     
     // 15 minute (medium)
     if (realtime.medium?.available) {
-        document.getElementById('stat-15m-active').textContent = realtime.medium.active || 0;
-        document.getElementById('stat-15m-passive').textContent = realtime.medium.passive || 0;
+        setText('stat-15m-active', realtime.medium.active || 0);
+        setText('stat-15m-passive', realtime.medium.passive || 0);
     } else {
-        document.getElementById('stat-15m-active').textContent = '-';
-        document.getElementById('stat-15m-passive').textContent = '-';
+        setText('stat-15m-active', '-');
+        setText('stat-15m-passive', '-');
     }
     
     // 60 minute (long)
     if (realtime.long?.available) {
-        document.getElementById('stat-60m-active').textContent = realtime.long.active || 0;
-        document.getElementById('stat-60m-passive').textContent = realtime.long.passive || 0;
+        setText('stat-60m-active', realtime.long.active || 0);
+        setText('stat-60m-passive', realtime.long.passive || 0);
     } else {
-        document.getElementById('stat-60m-active').textContent = '-';
-        document.getElementById('stat-60m-passive').textContent = '-';
+        setText('stat-60m-active', '-');
+        setText('stat-60m-passive', '-');
     }
 }
 
 function updateDailySection(report) {
+    // Check if daily elements exist (they may be commented out in HTML)
+    const totalEl = document.getElementById('stat-total');
+    if (!totalEl) return; // Elements not in DOM, skip update
+    
     if (!report) {
         // No report available - show placeholder
-        document.getElementById('stat-total').textContent = '--';
-        document.getElementById('stat-current').textContent = '--';
-        document.getElementById('stat-peak').textContent = '--';
+        totalEl.textContent = '--';
+        const currentEl = document.getElementById('stat-current');
+        const peakEl = document.getElementById('stat-peak');
+        if (currentEl) currentEl.textContent = '--';
+        if (peakEl) peakEl.textContent = '--';
         
         // Clear the chart
         const canvas = document.getElementById('hourly-chart');
@@ -614,7 +627,7 @@ function updateDailySection(report) {
     
     // Update summary stats
     const summary = report.summary || {};
-    document.getElementById('stat-total').textContent = summary.total_unique_people || 0;
+    totalEl.textContent = summary.total_unique_people || 0;
     
     // Find current hour and peak hour from hourly data
     const hourlyData = report.hourly_trends || [];
@@ -622,16 +635,20 @@ function updateDailySection(report) {
     
     // Find current hour count
     const currentHourData = hourlyData.find(h => h.hour === currentHour);
-    document.getElementById('stat-current').textContent = currentHourData ? currentHourData.total_people : 0;
+    const currentEl = document.getElementById('stat-current');
+    if (currentEl) currentEl.textContent = currentHourData ? currentHourData.total_people : 0;
     
     // Use peak_times from report
     const peakTimes = report.peak_times || {};
-    if (peakTimes.peak_hour !== null && peakTimes.peak_hour !== undefined) {
-        const peakHour = peakTimes.peak_hour;
-        const label = peakHour === 0 ? '12a' : peakHour === 12 ? '12p' : peakHour < 12 ? `${peakHour}a` : `${peakHour-12}p`;
-        document.getElementById('stat-peak').textContent = label;
-    } else {
-        document.getElementById('stat-peak').textContent = '--';
+    const peakEl = document.getElementById('stat-peak');
+    if (peakEl) {
+        if (peakTimes.peak_hour !== null && peakTimes.peak_hour !== undefined) {
+            const peakHour = peakTimes.peak_hour;
+            const label = peakHour === 0 ? '12a' : peakHour === 12 ? '12p' : peakHour < 12 ? `${peakHour}a` : `${peakHour-12}p`;
+            peakEl.textContent = label;
+        } else {
+            peakEl.textContent = '--';
+        }
     }
     
     // Draw hourly chart

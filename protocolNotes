@@ -1,0 +1,5 @@
+create a new section ## Protocols before #sym:## Operating Software 
+
+- Input
+--RTSP
+The system uses standard POE security cameras. While these are often designed to work with proprietary NVRs, many also have the ability to broadcast using the standard Real Time Streaming (RTSP) protocol. [hyperlink to website that explains the sttandard]. This open protocol can be read by most any programming language. Drop Ceiling uses 2 Reolink 
