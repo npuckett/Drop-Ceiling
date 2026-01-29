@@ -29,14 +29,24 @@ const CONFIG = {
         3: -22.5,
     },
     
-    // Trackzone dimensions
+    // Trackzone dimensions (matches Python TRACKZONE_PARAMS)
     TRACKZONE: {
-        width: 475,
-        depth: 205,
-        height: 300,
+        width: 260,       // X dimension
+        depth: 205,       // Z dimension
+        height: 300,      // Y dimension
         offset_z: 78,
         offset_y: -66,
-        center_x: 120,
+        center_x: -150,   // Negative X (units are at negative X)
+    },
+    
+    // Wander box (matches Python WANDER_BOX)
+    WANDER_BOX: {
+        min_x: -280,
+        max_x: -20,
+        min_y: 0,
+        max_y: 150,
+        min_z: -28,
+        max_z: 32,
     },
     
     // WebSocket settings
@@ -55,6 +65,9 @@ let lightSphere, lightGlow, falloffSphere;
 let trackedPeople = {};
 let wsConnection = null;
 let currentState = null;
+let lastReportVersion = -1;  // Track report version to avoid redundant updates
+let latestDailyReport = null;  // Store latest report for when panel opens
+let latestRealtimeTrends = null;  // Store realtime trends
 
 // =============================================================================
 // INITIALIZATION
@@ -71,8 +84,9 @@ function init() {
     
     // Position camera for a good view of panels and tracking area
     // Looking from front-right side, further back to see people
-    camera.position.set(450, 250, 400);
-    camera.lookAt(120, 80, 100);
+    // Units are at negative X (-30 to -270), so position camera to see that area
+    camera.position.set(200, 250, 400);
+    camera.lookAt(-150, 80, 50);
     
     // Renderer
     const canvas = document.getElementById('viewer');
@@ -86,7 +100,7 @@ function init() {
     
     // Orbit controls - allows user to rotate/pan/zoom camera
     controls = new OrbitControls(camera, renderer.domElement);
-    controls.target.set(120, 60, 80);  // Look at center of scene
+    controls.target.set(-150, 60, 50);  // Look at center of units (negative X)
     controls.enableDamping = true;
     controls.dampingFactor = 0.05;
     controls.minDistance = 100;
@@ -119,6 +133,29 @@ function init() {
         }
     });
     
+    // Trends panel toggle
+    const trendsPanel = document.getElementById('trends-panel');
+    const trendsBtn = document.getElementById('trends-btn');
+    const trendsHeader = document.getElementById('trends-header');
+    
+    // Start hidden
+    trendsPanel.classList.add('hidden');
+    
+    trendsBtn.addEventListener('click', () => {
+        if (trendsPanel.classList.contains('hidden')) {
+            trendsPanel.classList.remove('hidden');
+            trendsPanel.classList.remove('collapsed');
+            // Refresh the display with latest data when opening
+            updateTrendsDisplay(latestDailyReport, latestRealtimeTrends);
+        } else {
+            trendsPanel.classList.add('hidden');
+        }
+    });
+    
+    trendsHeader.addEventListener('click', () => {
+        trendsPanel.classList.toggle('collapsed');
+    });
+    
     // Auto-connect to Tailscale endpoint
     connectWebSocket(CONFIG.WS_URL);
     
@@ -140,12 +177,12 @@ function createFloor() {
     });
     const floor = new THREE.Mesh(floorGeom, floorMat);
     floor.rotation.x = -Math.PI / 2;
-    floor.position.set(120, 0, (CONFIG.TRACKZONE.offset_z - 200) / 2);
+    floor.position.set(CONFIG.TRACKZONE.center_x, 0, (CONFIG.TRACKZONE.offset_z - 200) / 2);
     scene.add(floor);
     
     // Grid lines for depth
     const gridHelper = new THREE.GridHelper(500, 20, 0x333340, 0x222230);
-    gridHelper.position.set(120, 0.1, 0);
+    gridHelper.position.set(CONFIG.TRACKZONE.center_x, 0.1, 0);
     scene.add(gridHelper);
 }
 
@@ -156,7 +193,8 @@ function createPanels() {
     const INNER_SIZE = CONFIG.PANEL_SIZE - (FRAME_WIDTH * 2); // Lit area size
     
     for (let unit = 0; unit < 4; unit++) {
-        const unitX = unit * CONFIG.UNIT_SPACING;
+        // Unit X positions: Unit 0 at -30, Unit 1 at -110, Unit 2 at -190, Unit 3 at -270
+        const unitX = -(unit * CONFIG.UNIT_SPACING + 30);
         
         for (let panelNum = 1; panelNum <= 3; panelNum++) {
             const [localY, localZ] = CONFIG.PANEL_LOCAL_POSITIONS[panelNum];
@@ -247,6 +285,25 @@ function createTrackzone() {
     );
     tzLine.position.set(tz.center_x, tz.offset_y + tz.height / 2, tz.offset_z + tz.depth / 2);
     scene.add(tzLine);
+    
+    // Wander box wireframe (yellow) - where the light can wander
+    const wb = CONFIG.WANDER_BOX;
+    const wbWidth = wb.max_x - wb.min_x;
+    const wbHeight = wb.max_y - wb.min_y;
+    const wbDepth = wb.max_z - wb.min_z;
+    const wbGeom = new THREE.BoxGeometry(wbWidth, wbHeight, wbDepth);
+    const wbEdges = new THREE.EdgesGeometry(wbGeom);
+    const wbLine = new THREE.LineSegments(
+        wbEdges,
+        new THREE.LineBasicMaterial({ color: 0xffff00, transparent: true, opacity: 0.4 })
+    );
+    // Position at center of wander box
+    wbLine.position.set(
+        (wb.min_x + wb.max_x) / 2,
+        (wb.min_y + wb.max_y) / 2,
+        (wb.min_z + wb.max_z) / 2
+    );
+    scene.add(wbLine);
 }
 
 // =============================================================================
@@ -358,6 +415,28 @@ function handleStateUpdate(data) {
     if (data.status !== undefined) {
         document.getElementById('behavior-status').textContent = data.status || '';
     }
+    
+    // Store realtime trends (always update)
+    if (data.realtime_trends) {
+        latestRealtimeTrends = data.realtime_trends;
+        // Update the trends display if panel is visible
+        const trendsPanel = document.getElementById('trends-panel');
+        if (trendsPanel && !trendsPanel.classList.contains('hidden')) {
+            updateTrendsDisplay(latestDailyReport, latestRealtimeTrends);
+        }
+    }
+    
+    // Update daily report (only when report version changes)
+    const reportVersion = data.report_version ?? 0;
+    if (reportVersion !== lastReportVersion) {
+        lastReportVersion = reportVersion;
+        latestDailyReport = data.daily_report || null;
+        // Update display if panel is visible
+        const trendsPanel = document.getElementById('trends-panel');
+        if (trendsPanel && !trendsPanel.classList.contains('hidden')) {
+            updateTrendsDisplay(latestDailyReport, latestRealtimeTrends);
+        }
+    }
 }
 
 function updateTrackedPeople(peopleData) {
@@ -437,6 +516,188 @@ function onWindowResize() {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+// =============================================================================
+// TRENDS DISPLAY
+// =============================================================================
+
+function updateTrendsDisplay(report, realtime) {
+    // Update realtime section
+    updateRealtimeSection(realtime);
+    
+    // Update daily section
+    updateDailySection(report);
+}
+
+function updateRealtimeSection(realtime) {
+    if (!realtime) {
+        // No realtime data - show placeholders
+        document.getElementById('stat-period').textContent = '--';
+        document.getElementById('stat-1m-active').textContent = '-';
+        document.getElementById('stat-1m-passive').textContent = '-';
+        document.getElementById('stat-5m-active').textContent = '-';
+        document.getElementById('stat-5m-passive').textContent = '-';
+        document.getElementById('stat-15m-active').textContent = '-';
+        document.getElementById('stat-15m-passive').textContent = '-';
+        document.getElementById('stat-60m-active').textContent = '-';
+        document.getElementById('stat-60m-passive').textContent = '-';
+        return;
+    }
+    
+    // Period
+    const period = realtime.period || 'unknown';
+    const periodDisplay = period.replace('_', ' ').toUpperCase();
+    document.getElementById('stat-period').textContent = periodDisplay;
+    
+    // 1 minute (recent)
+    if (realtime.recent?.available) {
+        document.getElementById('stat-1m-active').textContent = realtime.recent.active || 0;
+        document.getElementById('stat-1m-passive').textContent = realtime.recent.passive || 0;
+    } else {
+        document.getElementById('stat-1m-active').textContent = '-';
+        document.getElementById('stat-1m-passive').textContent = '-';
+    }
+    
+    // 5 minute (short)
+    if (realtime.short?.available) {
+        document.getElementById('stat-5m-active').textContent = realtime.short.active || 0;
+        document.getElementById('stat-5m-passive').textContent = realtime.short.passive || 0;
+    } else {
+        document.getElementById('stat-5m-active').textContent = '-';
+        document.getElementById('stat-5m-passive').textContent = '-';
+    }
+    
+    // 15 minute (medium)
+    if (realtime.medium?.available) {
+        document.getElementById('stat-15m-active').textContent = realtime.medium.active || 0;
+        document.getElementById('stat-15m-passive').textContent = realtime.medium.passive || 0;
+    } else {
+        document.getElementById('stat-15m-active').textContent = '-';
+        document.getElementById('stat-15m-passive').textContent = '-';
+    }
+    
+    // 60 minute (long)
+    if (realtime.long?.available) {
+        document.getElementById('stat-60m-active').textContent = realtime.long.active || 0;
+        document.getElementById('stat-60m-passive').textContent = realtime.long.passive || 0;
+    } else {
+        document.getElementById('stat-60m-active').textContent = '-';
+        document.getElementById('stat-60m-passive').textContent = '-';
+    }
+}
+
+function updateDailySection(report) {
+    if (!report) {
+        // No report available - show placeholder
+        document.getElementById('stat-total').textContent = '--';
+        document.getElementById('stat-current').textContent = '--';
+        document.getElementById('stat-peak').textContent = '--';
+        
+        // Clear the chart
+        const canvas = document.getElementById('hourly-chart');
+        if (canvas) {
+            const ctx = canvas.getContext('2d');
+            const rect = canvas.parentElement.getBoundingClientRect();
+            const dpr = window.devicePixelRatio || 1;
+            canvas.width = rect.width * dpr;
+            canvas.height = rect.height * dpr;
+            ctx.scale(dpr, dpr);
+            ctx.clearRect(0, 0, rect.width, rect.height);
+            ctx.fillStyle = '#444455';
+            ctx.font = '10px Space Grotesk, sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText('Press R on server', rect.width / 2, rect.height / 2);
+        }
+        return;
+    }
+    
+    // Update summary stats
+    const summary = report.summary || {};
+    document.getElementById('stat-total').textContent = summary.total_unique_people || 0;
+    
+    // Find current hour and peak hour from hourly data
+    const hourlyData = report.hourly_trends || [];
+    const currentHour = new Date().getHours();
+    
+    // Find current hour count
+    const currentHourData = hourlyData.find(h => h.hour === currentHour);
+    document.getElementById('stat-current').textContent = currentHourData ? currentHourData.total_people : 0;
+    
+    // Use peak_times from report
+    const peakTimes = report.peak_times || {};
+    if (peakTimes.peak_hour !== null && peakTimes.peak_hour !== undefined) {
+        const peakHour = peakTimes.peak_hour;
+        const label = peakHour === 0 ? '12a' : peakHour === 12 ? '12p' : peakHour < 12 ? `${peakHour}a` : `${peakHour-12}p`;
+        document.getElementById('stat-peak').textContent = label;
+    } else {
+        document.getElementById('stat-peak').textContent = '--';
+    }
+    
+    // Draw hourly chart
+    drawHourlyChart(hourlyData, currentHour);
+}
+
+function drawHourlyChart(hourlyData, currentHour) {
+    const canvas = document.getElementById('hourly-chart');
+    if (!canvas) return;
+    
+    const ctx = canvas.getContext('2d');
+    const rect = canvas.parentElement.getBoundingClientRect();
+    
+    // Set canvas size with device pixel ratio for sharp rendering
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    ctx.scale(dpr, dpr);
+    
+    const width = rect.width;
+    const height = rect.height;
+    
+    // Clear
+    ctx.clearRect(0, 0, width, height);
+    
+    // Create hour map for quick lookup (24 hours) - use total_people
+    const hourMap = new Map();
+    hourlyData.forEach(h => hourMap.set(h.hour, h.total_people || 0));
+    
+    // Find max count for scaling
+    const maxCount = Math.max(...hourlyData.map(h => h.total_people || 0), 1);
+    
+    // Bar dimensions
+    const barPadding = 1;
+    const barWidth = (width - barPadding * 23) / 24;
+    const chartHeight = height - 16; // Leave room for labels
+    
+    // Draw bars for each hour
+    for (let hour = 0; hour < 24; hour++) {
+        const count = hourMap.get(hour) || 0;
+        const barHeight = (count / maxCount) * chartHeight;
+        const x = hour * (barWidth + barPadding);
+        const y = chartHeight - barHeight;
+        
+        // Color: highlight current hour, dim past hours, accent for future
+        if (hour === currentHour) {
+            ctx.fillStyle = '#4a9eff';  // Accent (current)
+        } else if (hour < currentHour) {
+            ctx.fillStyle = count > 0 ? '#444466' : '#222233';  // Past
+        } else {
+            ctx.fillStyle = '#333344';  // Future (no data yet)
+        }
+        
+        // Draw bar
+        ctx.fillRect(x, y, barWidth, barHeight);
+    }
+    
+    // Draw hour labels (every 6 hours)
+    ctx.fillStyle = '#666677';
+    ctx.font = '8px Space Grotesk, sans-serif';
+    ctx.textAlign = 'center';
+    [0, 6, 12, 18].forEach(hour => {
+        const x = hour * (barWidth + barPadding) + barWidth / 2;
+        const label = hour === 0 ? '12a' : hour === 12 ? '12p' : hour < 12 ? `${hour}a` : `${hour-12}p`;
+        ctx.fillText(label, x, height - 2);
+    });
 }
 
 // =============================================================================
