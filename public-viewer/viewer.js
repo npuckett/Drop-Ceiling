@@ -62,12 +62,26 @@ const CONFIG = {
 let scene, camera, renderer, controls;
 let panels = [];
 let lightSphere, lightGlow, falloffSphere;
+let wanderBoxMesh = null;  // Dynamic wander box wireframe
 let trackedPeople = {};
 let wsConnection = null;
 let currentState = null;
 let lastReportVersion = -1;  // Track report version to avoid redundant updates
 let latestDailyReport = null;  // Store latest report for when panel opens
 let latestRealtimeTrends = null;  // Store realtime trends
+
+// Wander box lerping state
+let currentWanderBox = { ...CONFIG.WANDER_BOX };  // Current displayed values
+let targetWanderBox = { ...CONFIG.WANDER_BOX };   // Target values from broadcast
+const WANDER_BOX_LERP_SPEED = 0.08;  // Lerp factor (0-1, higher = faster)
+
+// Trends overlay state
+const TRENDS_HISTORY_SIZE = 60;  // Number of data points to display (1 minute at 1/sec)
+const TRENDS_SAMPLE_INTERVAL = 1000;  // Sample every 1 second
+let trendsHistory = [];  // Array of { active, passive, timestamp }
+let lastTrendsSample = 0;
+let trendsCanvas = null;
+let trendsCtx = null;
 
 // =============================================================================
 // INITIALIZATION
@@ -77,16 +91,15 @@ function init() {
     // Scene
     scene = new THREE.Scene();
     scene.background = new THREE.Color(0x0a0a0c);
-    scene.fog = new THREE.Fog(0x0a0a0c, 400, 1200);
+    scene.fog = new THREE.Fog(0x0a0a0c, 800, 2000);
     
     // Camera - fixed position for mobile portrait view
-    camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 1, 2000);
+    camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 1, 3000);
     
-    // Position camera for a good view of panels and tracking area
-    // Looking from front-right side, further back to see people
-    // Units are at negative X (-30 to -270), so position camera to see that area
-    camera.position.set(200, 250, 450);
-    camera.lookAt(-150, 80, 120);
+    // Position camera high up, beyond the passive zone, centered with panels
+    // Panels center at X = -150, passive zone ends around Z = 283
+    camera.position.set(-150, 600, 700);
+    camera.lookAt(-150, 60, 0);
     
     // Renderer
     const canvas = document.getElementById('viewer');
@@ -100,11 +113,11 @@ function init() {
     
     // Orbit controls - allows user to rotate/pan/zoom camera
     controls = new OrbitControls(camera, renderer.domElement);
-    controls.target.set(-150, 60, 120);  // Look at center of tracking zones
+    controls.target.set(-150, 60, 100);  // Look at center of tracking zones
     controls.enableDamping = true;
     controls.dampingFactor = 0.05;
     controls.minDistance = 100;
-    controls.maxDistance = 1500;
+    controls.maxDistance = 2500;
     controls.update();
     
     // Lighting
@@ -116,6 +129,7 @@ function init() {
     createPanels();
     createPointLight();
     createTrackzone();
+    initTrendsOverlay();
     
     // Events
     window.addEventListener('resize', onWindowResize);
@@ -291,24 +305,35 @@ function createTrackzone() {
     tzLine.position.set(tz.center_x, tz.offset_y + tz.height / 2, tz.offset_z + tz.depth / 2);
     scene.add(tzLine);
     
-    // Wander box wireframe (yellow) - where the light can wander
-    const wb = CONFIG.WANDER_BOX;
+    // Initial wander box wireframe (green) - will be updated dynamically
+    updateWanderBox(CONFIG.WANDER_BOX);
+}
+
+function updateWanderBox(wb) {
+    // Remove old wander box if exists
+    if (wanderBoxMesh) {
+        scene.remove(wanderBoxMesh);
+        wanderBoxMesh.geometry.dispose();
+        wanderBoxMesh.material.dispose();
+    }
+    
+    // Create new wander box with updated dimensions
     const wbWidth = wb.max_x - wb.min_x;
     const wbHeight = wb.max_y - wb.min_y;
     const wbDepth = wb.max_z - wb.min_z;
     const wbGeom = new THREE.BoxGeometry(wbWidth, wbHeight, wbDepth);
     const wbEdges = new THREE.EdgesGeometry(wbGeom);
-    const wbLine = new THREE.LineSegments(
+    wanderBoxMesh = new THREE.LineSegments(
         wbEdges,
-        new THREE.LineBasicMaterial({ color: 0xffff00, transparent: true, opacity: 0.4 })
+        new THREE.LineBasicMaterial({ color: 0x00ff00, transparent: true, opacity: 0.5 })
     );
     // Position at center of wander box
-    wbLine.position.set(
+    wanderBoxMesh.position.set(
         (wb.min_x + wb.max_x) / 2,
         (wb.min_y + wb.max_y) / 2,
         (wb.min_z + wb.max_z) / 2
     );
-    scene.add(wbLine);
+    scene.add(wanderBoxMesh);
 }
 
 // =============================================================================
@@ -392,10 +417,10 @@ function handleStateUpdate(data) {
         data.panels.forEach((dmxValue, index) => {
             if (panels[index]) {
                 const normalizedBrightness = (dmxValue - 1) / 49; // Map 1-50 to 0-1
-                // Apply exponential curve for more dramatic effect (brights pop more)
-                const curved = Math.pow(normalizedBrightness, 0.6);
-                // Very dark minimum (0.03) to over-bright (1.2) with warm tint
-                const intensity = 0.03 + curved * 1.17;
+                // Apply steep curve - low values stay dark, only high values get bright
+                const curved = Math.pow(normalizedBrightness, 2.0);
+                // Nearly black minimum (0.005) to bright (1.5) for maximum range
+                const intensity = 0.005 + curved * 1.495;
                 panels[index].mesh.material.color.setRGB(
                     Math.min(intensity, 1.0), 
                     Math.min(intensity * 0.95, 1.0), 
@@ -419,6 +444,11 @@ function handleStateUpdate(data) {
     // Update behavior status text
     if (data.status !== undefined) {
         document.getElementById('behavior-status').textContent = data.status || '';
+    }
+    
+    // Update wander box target if changed (will lerp in animate loop)
+    if (data.wander_box) {
+        targetWanderBox = { ...data.wander_box };
     }
     
     // Store realtime trends (always update)
@@ -508,6 +538,9 @@ function animate() {
     // Update orbit controls
     controls.update();
     
+    // Lerp wander box towards target
+    lerpWanderBox();
+    
     // Pulse the light glow slightly
     if (lightGlow && currentState?.light) {
         const pulse = Math.sin(Date.now() * 0.003) * 0.1 + 1;
@@ -517,10 +550,257 @@ function animate() {
     renderer.render(scene, camera);
 }
 
+function lerpWanderBox() {
+    // Check if we need to update (any value different)
+    const needsUpdate = 
+        Math.abs(currentWanderBox.min_x - targetWanderBox.min_x) > 0.01 ||
+        Math.abs(currentWanderBox.max_x - targetWanderBox.max_x) > 0.01 ||
+        Math.abs(currentWanderBox.min_y - targetWanderBox.min_y) > 0.01 ||
+        Math.abs(currentWanderBox.max_y - targetWanderBox.max_y) > 0.01 ||
+        Math.abs(currentWanderBox.min_z - targetWanderBox.min_z) > 0.01 ||
+        Math.abs(currentWanderBox.max_z - targetWanderBox.max_z) > 0.01;
+    
+    if (!needsUpdate) return;
+    
+    // Lerp each value towards target
+    currentWanderBox.min_x += (targetWanderBox.min_x - currentWanderBox.min_x) * WANDER_BOX_LERP_SPEED;
+    currentWanderBox.max_x += (targetWanderBox.max_x - currentWanderBox.max_x) * WANDER_BOX_LERP_SPEED;
+    currentWanderBox.min_y += (targetWanderBox.min_y - currentWanderBox.min_y) * WANDER_BOX_LERP_SPEED;
+    currentWanderBox.max_y += (targetWanderBox.max_y - currentWanderBox.max_y) * WANDER_BOX_LERP_SPEED;
+    currentWanderBox.min_z += (targetWanderBox.min_z - currentWanderBox.min_z) * WANDER_BOX_LERP_SPEED;
+    currentWanderBox.max_z += (targetWanderBox.max_z - currentWanderBox.max_z) * WANDER_BOX_LERP_SPEED;
+    
+    // Update the visual
+    updateWanderBox(currentWanderBox);
+}
+
 function onWindowResize() {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
+    resizeTrendsCanvas();
+}
+
+// =============================================================================
+// TRENDS OVERLAY (Bottom of screen time visualization)
+// =============================================================================
+
+function initTrendsOverlay() {
+    trendsCanvas = document.getElementById('trends-canvas');
+    if (!trendsCanvas) return;
+    
+    trendsCtx = trendsCanvas.getContext('2d');
+    resizeTrendsCanvas();
+    
+    // Start the render loop for trends
+    requestAnimationFrame(renderTrendsOverlay);
+}
+
+function resizeTrendsCanvas() {
+    if (!trendsCanvas || !trendsCtx) return;
+    
+    const rect = trendsCanvas.parentElement.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    trendsCanvas.width = rect.width * dpr;
+    trendsCanvas.height = rect.height * dpr;
+    trendsCtx.setTransform(1, 0, 0, 1, 0, 0);
+    trendsCtx.scale(dpr, dpr);
+}
+
+function sampleTrendsData() {
+    // Sample event counts at regular intervals
+    // These are cumulative counts of zone-crossing events within time windows
+    const now = Date.now();
+    if (now - lastTrendsSample < TRENDS_SAMPLE_INTERVAL) return;
+    
+    lastTrendsSample = now;
+    
+    // Get event counts from realtime trends
+    // Engaged = active zone events (triggered installation response)
+    // Passing = passive zone events (walked through without engaging)
+    let engaged = 0;
+    let passing = 0;
+    
+    if (latestRealtimeTrends?.recent?.available) {
+        // Use realtime trends data (events in last 1 minute window)
+        engaged = latestRealtimeTrends.recent.active || 0;
+        passing = latestRealtimeTrends.recent.passive || 0;
+    } else if (currentState?.people) {
+        // Fallback: use current people count as proxy
+        const peopleCount = currentState.people.length;
+        if (currentState.mode === 'engaged' || currentState.mode === 'crowd') {
+            engaged = peopleCount;
+        } else {
+            passing = peopleCount;
+        }
+    }
+    
+    trendsHistory.push({
+        active: engaged,
+        passive: passing,
+        timestamp: now
+    });
+    
+    // Trim old data
+    while (trendsHistory.length > TRENDS_HISTORY_SIZE) {
+        trendsHistory.shift();
+    }
+}
+
+function renderTrendsOverlay() {
+    requestAnimationFrame(renderTrendsOverlay);
+    
+    // Sample new data
+    sampleTrendsData();
+    
+    if (!trendsCtx || !trendsCanvas) return;
+    
+    const rect = trendsCanvas.parentElement.getBoundingClientRect();
+    const width = rect.width;
+    const height = rect.height;
+    
+    // Clear
+    trendsCtx.clearRect(0, 0, width, height);
+    
+    if (trendsHistory.length < 2) return;
+    
+    // Find max value for scaling
+    let maxValue = 1;
+    for (const point of trendsHistory) {
+        maxValue = Math.max(maxValue, point.active + point.passive);
+    }
+    
+    // Add headroom
+    maxValue = Math.ceil(maxValue * 1.2) || 1;
+    
+    // Chart dimensions (compact for top row)
+    const padding = { left: 30, right: 10, top: 8, bottom: 8 };
+    const chartWidth = width - padding.left - padding.right;
+    const chartHeight = height - padding.top - padding.bottom;
+    
+    // Draw subtle grid lines
+    trendsCtx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
+    trendsCtx.lineWidth = 1;
+    for (let i = 0; i <= 2; i++) {
+        const y = padding.top + (chartHeight * i / 2);
+        trendsCtx.beginPath();
+        trendsCtx.moveTo(padding.left, y);
+        trendsCtx.lineTo(width - padding.right, y);
+        trendsCtx.stroke();
+    }
+    
+    // Draw Y-axis max label
+    trendsCtx.fillStyle = 'rgba(255, 255, 255, 0.3)';
+    trendsCtx.font = '8px Space Grotesk, sans-serif';
+    trendsCtx.textAlign = 'right';
+    trendsCtx.textBaseline = 'middle';
+    trendsCtx.fillText(maxValue.toString(), padding.left - 5, padding.top + 5);
+    
+    // Draw X-axis time labels
+    trendsCtx.textAlign = 'left';
+    trendsCtx.textBaseline = 'bottom';
+    trendsCtx.fillText('60s ago', padding.left, height - 2);
+    trendsCtx.textAlign = 'right';
+    trendsCtx.fillText('now', width - padding.right, height - 2);
+    
+    // Calculate point positions
+    const pointSpacing = chartWidth / (TRENDS_HISTORY_SIZE - 1);
+    
+    // Draw stacked area chart (passive on bottom, active on top)
+    // Draw passive area (blue)
+    trendsCtx.beginPath();
+    trendsCtx.moveTo(padding.left, height - padding.bottom);
+    
+    for (let i = 0; i < trendsHistory.length; i++) {
+        const x = padding.left + (i * pointSpacing);
+        const passiveHeight = (trendsHistory[i].passive / maxValue) * chartHeight;
+        const y = height - padding.bottom - passiveHeight;
+        
+        if (i === 0) {
+            trendsCtx.lineTo(x, y);
+        } else {
+            trendsCtx.lineTo(x, y);
+        }
+    }
+    
+    // Close the path
+    const lastX = padding.left + ((trendsHistory.length - 1) * pointSpacing);
+    trendsCtx.lineTo(lastX, height - padding.bottom);
+    trendsCtx.closePath();
+    
+    // Fill passing area (green - matches 3D tracked people)
+    const passingGradient = trendsCtx.createLinearGradient(0, padding.top, 0, height - padding.bottom);
+    passingGradient.addColorStop(0, 'rgba(102, 238, 136, 0.4)');
+    passingGradient.addColorStop(1, 'rgba(102, 238, 136, 0.1)');
+    trendsCtx.fillStyle = passingGradient;
+    trendsCtx.fill();
+    
+    // Draw active area (green) stacked on top of passive
+    trendsCtx.beginPath();
+    
+    // Start from the passive line
+    for (let i = trendsHistory.length - 1; i >= 0; i--) {
+        const x = padding.left + (i * pointSpacing);
+        const passiveHeight = (trendsHistory[i].passive / maxValue) * chartHeight;
+        const y = height - padding.bottom - passiveHeight;
+        
+        if (i === trendsHistory.length - 1) {
+            trendsCtx.moveTo(x, y);
+        } else {
+            trendsCtx.lineTo(x, y);
+        }
+    }
+    
+    // Go up to active + passive level
+    for (let i = 0; i < trendsHistory.length; i++) {
+        const x = padding.left + (i * pointSpacing);
+        const totalHeight = ((trendsHistory[i].passive + trendsHistory[i].active) / maxValue) * chartHeight;
+        const y = height - padding.bottom - totalHeight;
+        trendsCtx.lineTo(x, y);
+    }
+    
+    trendsCtx.closePath();
+    
+    // Fill engaged area (orange - stands out from green people)
+    const engagedGradient = trendsCtx.createLinearGradient(0, padding.top, 0, height - padding.bottom);
+    engagedGradient.addColorStop(0, 'rgba(255, 170, 68, 0.5)');
+    engagedGradient.addColorStop(1, 'rgba(255, 170, 68, 0.15)');
+    trendsCtx.fillStyle = engagedGradient;
+    trendsCtx.fill();
+    
+    // Draw active line on top
+    trendsCtx.beginPath();
+    for (let i = 0; i < trendsHistory.length; i++) {
+        const x = padding.left + (i * pointSpacing);
+        const totalHeight = ((trendsHistory[i].passive + trendsHistory[i].active) / maxValue) * chartHeight;
+        const y = height - padding.bottom - totalHeight;
+        
+        if (i === 0) {
+            trendsCtx.moveTo(x, y);
+        } else {
+            trendsCtx.lineTo(x, y);
+        }
+    }
+    trendsCtx.strokeStyle = 'rgba(255, 170, 68, 0.8)';
+    trendsCtx.lineWidth = 1.5;
+    trendsCtx.stroke();
+    
+    // Draw passing line (green)
+    trendsCtx.beginPath();
+    for (let i = 0; i < trendsHistory.length; i++) {
+        const x = padding.left + (i * pointSpacing);
+        const passiveHeight = (trendsHistory[i].passive / maxValue) * chartHeight;
+        const y = height - padding.bottom - passiveHeight;
+        
+        if (i === 0) {
+            trendsCtx.moveTo(x, y);
+        } else {
+            trendsCtx.lineTo(x, y);
+        }
+    }
+    trendsCtx.strokeStyle = 'rgba(102, 238, 136, 0.8)';
+    trendsCtx.lineWidth = 1.5;
+    trendsCtx.stroke();
 }
 
 // =============================================================================
