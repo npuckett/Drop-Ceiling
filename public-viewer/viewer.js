@@ -69,6 +69,7 @@ let currentState = null;
 let lastReportVersion = -1;  // Track report version to avoid redundant updates
 let latestDailyReport = null;  // Store latest report for when panel opens
 let latestRealtimeTrends = null;  // Store realtime trends
+let lastAutoTuning = null;  // Store latest auto-tuning data
 
 // Wander box lerping state
 let currentWanderBox = { ...CONFIG.WANDER_BOX };  // Current displayed values
@@ -80,8 +81,8 @@ const TRENDS_HISTORY_SIZE = 60;  // Number of data points to display (1 minute a
 const TRENDS_SAMPLE_INTERVAL = 1000;  // Sample every 1 second
 let trendsHistory = [];  // Array of { active, passive, timestamp }
 let lastTrendsSample = 0;
-let trendsCanvas = null;
-let trendsCtx = null;
+let trendsInputCanvas = null;
+let trendsInputCtx = null;
 
 // =============================================================================
 // INITIALIZATION
@@ -96,10 +97,10 @@ function init() {
     // Camera - fixed position for mobile portrait view
     camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 1, 3000);
     
-    // Position camera high up, beyond the passive zone, centered with panels
-    // Panels center at X = -150, passive zone ends around Z = 283
-    camera.position.set(-150, 600, 700);
-    camera.lookAt(-150, 60, 0);
+    // Position camera higher and farther back to include more passive zone
+    // Panels center at X = -150, passive zone ends around Z = 553
+    camera.position.set(-138.86, 607.56, 889.87);
+    camera.lookAt(-140.45, 18.08, 434.19);
     
     // Renderer
     const canvas = document.getElementById('viewer');
@@ -113,7 +114,7 @@ function init() {
     
     // Orbit controls - allows user to rotate/pan/zoom camera
     controls = new OrbitControls(camera, renderer.domElement);
-    controls.target.set(-150, 60, 100);  // Look at center of tracking zones
+    controls.target.set(-140.45, 18.08, 434.19);  // Look deeper into passive zone
     controls.enableDamping = true;
     controls.dampingFactor = 0.05;
     controls.minDistance = 100;
@@ -133,6 +134,20 @@ function init() {
     
     // Events
     window.addEventListener('resize', onWindowResize);
+    window.addEventListener('keydown', (event) => {
+        if (event.key.toLowerCase() === 'p') {
+            printCameraState();
+        }
+    });
+
+    const trendsOverlay = document.getElementById('trends-overlay');
+    if (trendsOverlay) {
+        trendsOverlay.addEventListener('wheel', (event) => event.stopPropagation(), { passive: true });
+        trendsOverlay.addEventListener('pointerdown', () => { controls.enabled = false; });
+        trendsOverlay.addEventListener('pointerup', () => { controls.enabled = true; });
+        trendsOverlay.addEventListener('pointercancel', () => { controls.enabled = true; });
+        trendsOverlay.addEventListener('pointerleave', () => { controls.enabled = true; });
+    }
     
     // About modal
     document.getElementById('about-btn').addEventListener('click', () => {
@@ -146,6 +161,7 @@ function init() {
             document.getElementById('about-overlay').classList.add('hidden');
         }
     });
+
     
     // Trends panel toggle (elements may be commented out in HTML)
     const trendsPanel = document.getElementById('trends-panel');
@@ -383,9 +399,10 @@ function connectWebSocket() {
 }
 
 function updateStatus(state, text) {
-    const statusEl = document.getElementById('status-text');
+    const statusEl = document.getElementById('connection-status');
+    if (!statusEl) return;
     statusEl.textContent = text;
-    statusEl.className = state;
+    statusEl.className = `subtitle ${state}`;
 }
 
 // =============================================================================
@@ -417,15 +434,43 @@ function handleStateUpdate(data) {
         data.panels.forEach((dmxValue, index) => {
             if (panels[index]) {
                 const normalizedBrightness = (dmxValue - 1) / 49; // Map 1-50 to 0-1
-                // Apply steep curve - low values stay dark, only high values get bright
-                const curved = Math.pow(normalizedBrightness, 2.0);
-                // Nearly black minimum (0.005) to bright (1.5) for maximum range
-                const intensity = 0.005 + curved * 1.495;
-                panels[index].mesh.material.color.setRGB(
-                    Math.min(intensity, 1.0), 
-                    Math.min(intensity * 0.95, 1.0), 
-                    Math.min(intensity * 0.85, 1.0)
+                const curved = Math.pow(normalizedBrightness, 0.8); // Boost low values
+                
+                // Lit area: warm white, fully visible
+                const r = 0.03 + curved * 0.97;
+                const g = 0.03 + curved * 0.94;
+                const b = 0.02 + curved * 0.78;
+                panels[index].mesh.material.color.setRGB(r, g, b);
+                panels[index].mesh.material.opacity = 0.1 + curved * 0.9;
+                
+                // Frame also picks up light - subtle ambient glow
+                const frameGlow = curved * 0.35;
+                panels[index].frame.material.color.setRGB(
+                    0.16 + frameGlow,
+                    0.16 + frameGlow * 0.95,
+                    0.18 + frameGlow * 0.7
                 );
+                
+                // Create/update glow plane if it doesn't exist
+                if (!panels[index].glowPlane) {
+                    const glowGeom = new THREE.PlaneGeometry(60, 60);
+                    const glowMat = new THREE.MeshBasicMaterial({
+                        color: 0xfff5e0,
+                        transparent: true,
+                        opacity: 0,
+                        side: THREE.DoubleSide,
+                        depthWrite: false,
+                    });
+                    const glowPlane = new THREE.Mesh(glowGeom, glowMat);
+                    glowPlane.position.z = 1.2; // In front of panel
+                    panels[index].group.add(glowPlane);
+                    panels[index].glowPlane = glowPlane;
+                }
+                // Glow plane becomes visible at mid-high brightness
+                const glowOpacity = Math.max(0, (curved - 0.2) * 0.5);
+                panels[index].glowPlane.material.opacity = glowOpacity;
+                panels[index].glowPlane.scale.setScalar(1.0 + curved * 0.3);
+                
                 panels[index].brightness = normalizedBrightness;
             }
         });
@@ -436,15 +481,18 @@ function handleStateUpdate(data) {
         updateTrackedPeople(data.people);
     }
     
-    // Update mode display
-    if (data.mode) {
-        updateModeDisplay(data.mode, data.status);
+    // Update header subheading with status text
+    if (data.status !== undefined) {
+        const statusEl = document.getElementById('behavior-status');
+        if (statusEl) statusEl.textContent = data.status || '';
     }
     
-    // Update behavior status text
-    if (data.status !== undefined) {
-        document.getElementById('behavior-status').textContent = data.status || '';
+    // Update auto-tuning parameter display
+    if (data.auto_tuning) {
+        lastAutoTuning = data.auto_tuning;
+        updateAutoTuneDisplay(data.auto_tuning);
     }
+
     
     // Update wander box target if changed (will lerp in animate loop)
     if (data.wander_box) {
@@ -472,6 +520,27 @@ function handleStateUpdate(data) {
             updateTrendsDisplay(latestDailyReport, latestRealtimeTrends);
         }
     }
+
+    updateTrendStats();
+    updateTuningBars();
+}
+
+function printCameraState() {
+    const state = {
+        position: {
+            x: Number(camera.position.x.toFixed(2)),
+            y: Number(camera.position.y.toFixed(2)),
+            z: Number(camera.position.z.toFixed(2)),
+        },
+        target: {
+            x: Number(controls.target.x.toFixed(2)),
+            y: Number(controls.target.y.toFixed(2)),
+            z: Number(controls.target.z.toFixed(2)),
+        },
+        zoom: Number(camera.zoom.toFixed(2)),
+        fov: Number(camera.fov.toFixed(2)),
+    };
+    console.log('Camera state:', state);
 }
 
 function updateTrackedPeople(peopleData) {
@@ -496,7 +565,10 @@ function updateTrackedPeople(peopleData) {
         }
         
         // Update position
-        trackedPeople[person.id].position.set(person.x, person.y + 85, person.z);
+        const personMesh = trackedPeople[person.id];
+        personMesh.position.set(person.x, person.y + 85, person.z);
+        const labelId = person.daily_id ?? person.id;
+        updateTextSprite(personMesh.userData.labelSprite, `#${labelId}`);
     });
 }
 
@@ -519,13 +591,132 @@ function createPersonMesh() {
     head.position.y = 85;
     group.add(head);
     
+    const label = createTextSprite('');
+    label.position.y = 120;
+    group.add(label);
+    group.userData.labelSprite = label;
+    
     return group;
 }
 
-function updateModeDisplay(mode, statusText) {
-    const modeLabel = document.getElementById('mode-label');
-    modeLabel.textContent = mode.toUpperCase();
-    modeLabel.className = `visible ${mode}`;
+function createTextSprite(text) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 256;
+    canvas.height = 64;
+    const ctx = canvas.getContext('2d');
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.minFilter = THREE.LinearFilter;
+    const material = new THREE.SpriteMaterial({ map: texture, transparent: true });
+    const sprite = new THREE.Sprite(material);
+    sprite.scale.set(70, 18, 1);
+    sprite.userData = { canvas, ctx, texture, text: '' };
+    updateTextSprite(sprite, text);
+    return sprite;
+}
+
+function updateTextSprite(sprite, text) {
+    if (!sprite || !sprite.userData) return;
+    if (sprite.userData.text === text) return;
+    const { canvas, ctx, texture } = sprite.userData;
+    const w = canvas.width;
+    const h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+    ctx.fillRect(0, 0, w, h);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '28px Space Grotesk, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, w / 2, h / 2 + 2);
+    texture.needsUpdate = true;
+    sprite.userData.text = text;
+}
+
+function updateTrendStats() {
+    const currentCountEl = document.getElementById('trend-current');
+    const currentActiveEl = document.getElementById('trend-current-active');
+    const currentPassiveEl = document.getElementById('trend-current-passive');
+    if (currentCountEl) {
+        const currentCount = currentState?.population?.current ?? currentState?.counts?.total ?? 0;
+        currentCountEl.textContent = currentCount;
+    }
+    if (currentActiveEl) {
+        const active = currentState?.population?.active ?? currentState?.counts?.active ?? 0;
+        currentActiveEl.textContent = active;
+    }
+    if (currentPassiveEl) {
+        const passive = currentState?.population?.passive ?? currentState?.counts?.passive ?? 0;
+        currentPassiveEl.textContent = passive;
+    }
+
+}
+
+function updateTuningBars() {
+    const lastAdjustment = lastAutoTuning?.last_adjustment || {};
+    const tuningRanges = [
+        { key: 'short', weight: lastAdjustment.short_activity, available: latestRealtimeTrends?.short?.available },
+        { key: 'med', weight: lastAdjustment.medium_activity, available: latestRealtimeTrends?.medium?.available },
+        { key: 'long', weight: lastAdjustment.long_activity, available: latestRealtimeTrends?.long?.available },
+    ];
+
+    tuningRanges.forEach((range) => {
+        const weight = typeof range.weight === 'number' ? Math.max(0, Math.min(range.weight, 1)) : null;
+        const isAvailable = range.available && weight !== null;
+        const activeWidth = isAvailable ? weight * 100 : 0;
+
+        if (range.key === 'long') {
+            const longRow = document.getElementById('trend-long-row');
+            if (longRow) {
+                longRow.style.display = isAvailable ? 'grid' : 'none';
+            }
+        }
+
+        const activeEl = document.getElementById(`trend-${range.key}-bar-active`);
+        const passiveEl = document.getElementById(`trend-${range.key}-bar-passive`);
+        const totalEl = document.getElementById(`trend-${range.key}-total`);
+        const weightEl = document.getElementById(`trend-${range.key}-weight`);
+
+        if (activeEl) activeEl.style.width = `${activeWidth}%`;
+        if (passiveEl) passiveEl.style.width = '0%';
+        if (weightEl) weightEl.textContent = isAvailable ? `${Math.round(weight * 100)}%` : '--';
+        if (totalEl) totalEl.textContent = isAvailable ? '' : '-';
+    });
+}
+
+function updateAutoTuneDisplay(autoTuning) {
+    const statusEl = document.getElementById('behavior-status-label');
+    if (statusEl) {
+        const enabled = autoTuning?.enabled;
+        statusEl.textContent = enabled ? 'On' : 'Off';
+        statusEl.classList.toggle('on', Boolean(enabled));
+    }
+
+    const params = autoTuning?.params || {};
+    const paramKeys = [
+        'responsiveness',
+        'energy',
+        'attention_span',
+        'sociability',
+        'exploration',
+        'memory',
+    ];
+
+    paramKeys.forEach((key) => {
+        const value = typeof params[key] === 'number' ? params[key] : 0;
+        const clamped = Math.min(Math.max(value, 0), 1);
+        const bar = document.getElementById(`param-${key}`);
+        if (bar) {
+            bar.style.width = `${clamped * 100}%`;
+        }
+    });
+
+    const pulse = document.getElementById('tuning-pulse');
+    if (pulse) {
+        const lastAdjustment = autoTuning?.last_adjustment?.timestamp ?? 0;
+        const age = Date.now() / 1000 - lastAdjustment;
+        pulse.classList.toggle('active', age >= 0 && age < 6);
+    }
+
 }
 
 // =============================================================================
@@ -586,10 +777,10 @@ function onWindowResize() {
 // =============================================================================
 
 function initTrendsOverlay() {
-    trendsCanvas = document.getElementById('trends-canvas');
-    if (!trendsCanvas) return;
+    trendsInputCanvas = document.getElementById('trends-input-canvas');
+    if (!trendsInputCanvas) return;
     
-    trendsCtx = trendsCanvas.getContext('2d');
+    trendsInputCtx = trendsInputCanvas.getContext('2d');
     resizeTrendsCanvas();
     
     // Start the render loop for trends
@@ -597,14 +788,15 @@ function initTrendsOverlay() {
 }
 
 function resizeTrendsCanvas() {
-    if (!trendsCanvas || !trendsCtx) return;
-    
-    const rect = trendsCanvas.parentElement.getBoundingClientRect();
+    if (!trendsInputCanvas || !trendsInputCtx) return;
+
     const dpr = window.devicePixelRatio || 1;
-    trendsCanvas.width = rect.width * dpr;
-    trendsCanvas.height = rect.height * dpr;
-    trendsCtx.setTransform(1, 0, 0, 1, 0, 0);
-    trendsCtx.scale(dpr, dpr);
+    const inputRect = trendsInputCanvas.parentElement.getBoundingClientRect();
+
+    trendsInputCanvas.width = inputRect.width * dpr;
+    trendsInputCanvas.height = inputRect.height * dpr;
+    trendsInputCtx.setTransform(1, 0, 0, 1, 0, 0);
+    trendsInputCtx.scale(dpr, dpr);
 }
 
 function sampleTrendsData() {
@@ -625,8 +817,16 @@ function sampleTrendsData() {
         // Use realtime trends data (events in last 1 minute window)
         engaged = latestRealtimeTrends.recent.active || 0;
         passing = latestRealtimeTrends.recent.passive || 0;
+    } else if (currentState?.population) {
+        // Use population counts (active/passive from zone classification)
+        engaged = currentState.population.active || 0;
+        passing = currentState.population.passive || 0;
+    } else if (currentState?.counts) {
+        // Legacy fallback using counts field
+        engaged = currentState.counts.active || 0;
+        passing = currentState.counts.passive || 0;
     } else if (currentState?.people) {
-        // Fallback: use current people count as proxy
+        // Last resort: use people array length
         const peopleCount = currentState.people.length;
         if (currentState.mode === 'engaged' || currentState.mode === 'crowd') {
             engaged = peopleCount;
@@ -640,7 +840,7 @@ function sampleTrendsData() {
         passive: passing,
         timestamp: now
     });
-    
+
     // Trim old data
     while (trendsHistory.length > TRENDS_HISTORY_SIZE) {
         trendsHistory.shift();
@@ -653,155 +853,126 @@ function renderTrendsOverlay() {
     // Sample new data
     sampleTrendsData();
     
-    if (!trendsCtx || !trendsCanvas) return;
-    
-    const rect = trendsCanvas.parentElement.getBoundingClientRect();
+    renderInputTrends();
+}
+
+function renderInputTrends() {
+    if (!trendsInputCtx || !trendsInputCanvas) return;
+
+    const rect = trendsInputCanvas.getBoundingClientRect();
     const width = rect.width;
     const height = rect.height;
-    
-    // Clear
-    trendsCtx.clearRect(0, 0, width, height);
-    
+    trendsInputCtx.clearRect(0, 0, width, height);
+
     if (trendsHistory.length < 2) return;
-    
-    // Find max value for scaling
+
     let maxValue = 1;
     for (const point of trendsHistory) {
         maxValue = Math.max(maxValue, point.active + point.passive);
     }
-    
-    // Add headroom
     maxValue = Math.ceil(maxValue * 1.2) || 1;
-    
-    // Chart dimensions (compact for top row)
-    const padding = { left: 30, right: 10, top: 8, bottom: 8 };
+
+    const padding = { left: 26, right: 8, top: 8, bottom: 16 };
     const chartWidth = width - padding.left - padding.right;
     const chartHeight = height - padding.top - padding.bottom;
-    
-    // Draw subtle grid lines
-    trendsCtx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
-    trendsCtx.lineWidth = 1;
+    const pointSpacing = chartWidth / (TRENDS_HISTORY_SIZE - 1);
+
+    trendsInputCtx.strokeStyle = 'rgba(255, 255, 255, 0.06)';
+    trendsInputCtx.lineWidth = 1;
     for (let i = 0; i <= 2; i++) {
         const y = padding.top + (chartHeight * i / 2);
-        trendsCtx.beginPath();
-        trendsCtx.moveTo(padding.left, y);
-        trendsCtx.lineTo(width - padding.right, y);
-        trendsCtx.stroke();
+        trendsInputCtx.beginPath();
+        trendsInputCtx.moveTo(padding.left, y);
+        trendsInputCtx.lineTo(width - padding.right, y);
+        trendsInputCtx.stroke();
     }
-    
-    // Draw Y-axis max label
-    trendsCtx.fillStyle = 'rgba(255, 255, 255, 0.3)';
-    trendsCtx.font = '8px Space Grotesk, sans-serif';
-    trendsCtx.textAlign = 'right';
-    trendsCtx.textBaseline = 'middle';
-    trendsCtx.fillText(maxValue.toString(), padding.left - 5, padding.top + 5);
-    
-    // Draw X-axis time labels
-    trendsCtx.textAlign = 'left';
-    trendsCtx.textBaseline = 'bottom';
-    trendsCtx.fillText('60s ago', padding.left, height - 2);
-    trendsCtx.textAlign = 'right';
-    trendsCtx.fillText('now', width - padding.right, height - 2);
-    
-    // Calculate point positions
-    const pointSpacing = chartWidth / (TRENDS_HISTORY_SIZE - 1);
-    
-    // Draw stacked area chart (passive on bottom, active on top)
-    // Draw passive area (blue)
-    trendsCtx.beginPath();
-    trendsCtx.moveTo(padding.left, height - padding.bottom);
-    
+
+    trendsInputCtx.fillStyle = 'rgba(255, 255, 255, 0.35)';
+    trendsInputCtx.font = '8px Space Grotesk, sans-serif';
+    trendsInputCtx.textAlign = 'right';
+    trendsInputCtx.textBaseline = 'middle';
+    trendsInputCtx.fillText(maxValue.toString(), padding.left - 4, padding.top + 6);
+
+    trendsInputCtx.textAlign = 'left';
+    trendsInputCtx.textBaseline = 'bottom';
+    trendsInputCtx.fillText('60s ago', padding.left, height - 2);
+    trendsInputCtx.textAlign = 'right';
+    trendsInputCtx.fillText('now', width - padding.right, height - 2);
+
+    trendsInputCtx.beginPath();
+    trendsInputCtx.moveTo(padding.left, height - padding.bottom);
     for (let i = 0; i < trendsHistory.length; i++) {
         const x = padding.left + (i * pointSpacing);
         const passiveHeight = (trendsHistory[i].passive / maxValue) * chartHeight;
         const y = height - padding.bottom - passiveHeight;
-        
-        if (i === 0) {
-            trendsCtx.lineTo(x, y);
-        } else {
-            trendsCtx.lineTo(x, y);
-        }
+        trendsInputCtx.lineTo(x, y);
     }
-    
-    // Close the path
     const lastX = padding.left + ((trendsHistory.length - 1) * pointSpacing);
-    trendsCtx.lineTo(lastX, height - padding.bottom);
-    trendsCtx.closePath();
-    
-    // Fill passing area (green - matches 3D tracked people)
-    const passingGradient = trendsCtx.createLinearGradient(0, padding.top, 0, height - padding.bottom);
+    trendsInputCtx.lineTo(lastX, height - padding.bottom);
+    trendsInputCtx.closePath();
+
+    const passingGradient = trendsInputCtx.createLinearGradient(0, padding.top, 0, height - padding.bottom);
     passingGradient.addColorStop(0, 'rgba(102, 238, 136, 0.4)');
     passingGradient.addColorStop(1, 'rgba(102, 238, 136, 0.1)');
-    trendsCtx.fillStyle = passingGradient;
-    trendsCtx.fill();
-    
-    // Draw active area (green) stacked on top of passive
-    trendsCtx.beginPath();
-    
-    // Start from the passive line
+    trendsInputCtx.fillStyle = passingGradient;
+    trendsInputCtx.fill();
+
+    trendsInputCtx.beginPath();
     for (let i = trendsHistory.length - 1; i >= 0; i--) {
         const x = padding.left + (i * pointSpacing);
         const passiveHeight = (trendsHistory[i].passive / maxValue) * chartHeight;
         const y = height - padding.bottom - passiveHeight;
-        
         if (i === trendsHistory.length - 1) {
-            trendsCtx.moveTo(x, y);
+            trendsInputCtx.moveTo(x, y);
         } else {
-            trendsCtx.lineTo(x, y);
+            trendsInputCtx.lineTo(x, y);
         }
     }
-    
-    // Go up to active + passive level
     for (let i = 0; i < trendsHistory.length; i++) {
         const x = padding.left + (i * pointSpacing);
         const totalHeight = ((trendsHistory[i].passive + trendsHistory[i].active) / maxValue) * chartHeight;
         const y = height - padding.bottom - totalHeight;
-        trendsCtx.lineTo(x, y);
+        trendsInputCtx.lineTo(x, y);
     }
-    
-    trendsCtx.closePath();
-    
-    // Fill engaged area (orange - stands out from green people)
-    const engagedGradient = trendsCtx.createLinearGradient(0, padding.top, 0, height - padding.bottom);
+    trendsInputCtx.closePath();
+
+    const engagedGradient = trendsInputCtx.createLinearGradient(0, padding.top, 0, height - padding.bottom);
     engagedGradient.addColorStop(0, 'rgba(255, 170, 68, 0.5)');
     engagedGradient.addColorStop(1, 'rgba(255, 170, 68, 0.15)');
-    trendsCtx.fillStyle = engagedGradient;
-    trendsCtx.fill();
-    
-    // Draw active line on top
-    trendsCtx.beginPath();
+    trendsInputCtx.fillStyle = engagedGradient;
+    trendsInputCtx.fill();
+
+    trendsInputCtx.beginPath();
     for (let i = 0; i < trendsHistory.length; i++) {
         const x = padding.left + (i * pointSpacing);
         const totalHeight = ((trendsHistory[i].passive + trendsHistory[i].active) / maxValue) * chartHeight;
         const y = height - padding.bottom - totalHeight;
-        
         if (i === 0) {
-            trendsCtx.moveTo(x, y);
+            trendsInputCtx.moveTo(x, y);
         } else {
-            trendsCtx.lineTo(x, y);
+            trendsInputCtx.lineTo(x, y);
         }
     }
-    trendsCtx.strokeStyle = 'rgba(255, 170, 68, 0.8)';
-    trendsCtx.lineWidth = 1.5;
-    trendsCtx.stroke();
-    
-    // Draw passing line (green)
-    trendsCtx.beginPath();
+    trendsInputCtx.strokeStyle = 'rgba(255, 170, 68, 0.85)';
+    trendsInputCtx.lineWidth = 1.5;
+    trendsInputCtx.stroke();
+
+    trendsInputCtx.beginPath();
     for (let i = 0; i < trendsHistory.length; i++) {
         const x = padding.left + (i * pointSpacing);
         const passiveHeight = (trendsHistory[i].passive / maxValue) * chartHeight;
         const y = height - padding.bottom - passiveHeight;
-        
         if (i === 0) {
-            trendsCtx.moveTo(x, y);
+            trendsInputCtx.moveTo(x, y);
         } else {
-            trendsCtx.lineTo(x, y);
+            trendsInputCtx.lineTo(x, y);
         }
     }
-    trendsCtx.strokeStyle = 'rgba(102, 238, 136, 0.8)';
-    trendsCtx.lineWidth = 1.5;
-    trendsCtx.stroke();
+    trendsInputCtx.strokeStyle = 'rgba(102, 238, 136, 0.85)';
+    trendsInputCtx.lineWidth = 1.5;
+    trendsInputCtx.stroke();
 }
+
 
 // =============================================================================
 // TRENDS DISPLAY

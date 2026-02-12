@@ -20,26 +20,96 @@
         <canvas id="viewer"></canvas>
     </div>
     
-    <div id="status">
-        <span id="status-text">Connecting...</span>
-    </div>
-
     <!-- Trends overlay at bottom of screen -->
     <div id="trends-overlay">
-        <canvas id="trends-canvas"></canvas>
-        <div id="trends-legend">
-            <span class="legend-label">1 min</span>
-            <span class="legend-item"><span class="legend-dot engaged"></span>Engaged</span>
-            <span class="legend-item"><span class="legend-dot passing"></span>Passing</span>
+        <div id="trends-header">
+            <div class="trends-title">
+                <button id="about-btn" class="title about-title">About</button>
+                <span class="title">Realtime Inputs / Outputs</span>
+                <span class="subtitle" id="connection-status">Connecting</span>
+            </div>
+            <div class="trends-now">
+                <span class="now-label">Now</span>
+                <span class="now-value" id="trend-current">0</span>
+                <span class="now-meta"><span id="trend-current-active">0</span> engaged | <span id="trend-current-passive">0</span> passing</span>
+            </div>
+        </div>
+        <div id="trends-panels">
+            <div class="trend-panel">
+                <div class="panel-label">Input Activity</div>
+                <canvas id="trends-input-canvas"></canvas>
+                <div class="panel-legend">
+                    <span class="legend-item"><span class="legend-dot engaged"></span>Engaged</span>
+                    <span class="legend-item"><span class="legend-dot passing"></span>Passing</span>
+                    <span class="legend-label">Zone events per min</span>
+                </div>
+            </div>
+            <div class="trend-panel behavior-panel">
+                <div class="behavior-header">
+                    <span class="behavior-title">Auto-Tune Weights</span>
+                    <span class="behavior-status" id="behavior-status-label">Off</span>
+                </div>
+                <div class="behavior-trends">
+                    <div class="behavior-note">Weights are derived from recent activity.</div>
+                    <div class="trend-row" data-range="short">
+                        <span class="trend-tag">5m <span class="trend-tag-value" id="trend-short-weight">--</span></span>
+                        <div class="trend-bar">
+                            <span class="trend-seg engaged" id="trend-short-bar-active"></span>
+                            <span class="trend-seg passing" id="trend-short-bar-passive"></span>
+                        </div>
+                        <span class="trend-count" id="trend-short-total">-</span>
+                    </div>
+                    <div class="trend-row" data-range="med">
+                        <span class="trend-tag">15m <span class="trend-tag-value" id="trend-med-weight">--</span></span>
+                        <div class="trend-bar">
+                            <span class="trend-seg engaged" id="trend-med-bar-active"></span>
+                            <span class="trend-seg passing" id="trend-med-bar-passive"></span>
+                        </div>
+                        <span class="trend-count" id="trend-med-total">-</span>
+                    </div>
+                    <div class="trend-row" data-range="long" id="trend-long-row">
+                        <span class="trend-tag">60m <span class="trend-tag-value" id="trend-long-weight">--</span></span>
+                        <div class="trend-bar">
+                            <span class="trend-seg engaged" id="trend-long-bar-active"></span>
+                            <span class="trend-seg passing" id="trend-long-bar-passive"></span>
+                        </div>
+                        <span class="trend-count" id="trend-long-total">-</span>
+                    </div>
+                </div>
+                <div class="behavior-params">
+                    <div class="param-item" data-param="responsiveness">
+                        <span class="param-label">Resp</span>
+                        <span class="param-bar"><span class="param-fill" id="param-responsiveness"></span></span>
+                    </div>
+                    <div class="param-item" data-param="energy">
+                        <span class="param-label">Enrg</span>
+                        <span class="param-bar"><span class="param-fill" id="param-energy"></span></span>
+                    </div>
+                    <div class="param-item" data-param="attention_span">
+                        <span class="param-label">Attn</span>
+                        <span class="param-bar"><span class="param-fill" id="param-attention_span"></span></span>
+                    </div>
+                    <div class="param-item" data-param="sociability">
+                        <span class="param-label">Socl</span>
+                        <span class="param-bar"><span class="param-fill" id="param-sociability"></span></span>
+                    </div>
+                    <div class="param-item" data-param="exploration">
+                        <span class="param-label">Expl</span>
+                        <span class="param-bar"><span class="param-fill" id="param-exploration"></span></span>
+                    </div>
+                    <div class="param-item" data-param="memory">
+                        <span class="param-label">Mem</span>
+                        <span class="param-bar"><span class="param-fill" id="param-memory"></span></span>
+                    </div>
+                </div>
+                <div class="behavior-footer">
+                    <span class="behavior-foot-label">Tuning activity</span>
+                    <span class="behavior-pulse" id="tuning-pulse"></span>
+                </div>
+            </div>
         </div>
     </div>
     
-    <div id="mode-display">
-        <span id="mode-label"></span>
-    </div>
-
-    <button id="about-btn">About</button>
-    <a id="github-btn" href="https://github.com/npuckett/Drop-Ceiling" target="_blank">GitHub</a>
     <!-- Trends button hidden until realtime data is deployed
     <button id="trends-btn">Trends</button>
     -->
@@ -114,6 +184,9 @@
                 <div class="design-team">
                     <h3>Design Team</h3>
                     <p>Nick Puckett<br>Joshua Pothen</p>
+                </div>
+                <div class="about-links">
+                    <a id="github-btn" href="https://github.com/npuckett/Drop-Ceiling" target="_blank" rel="noopener">GitHub</a>
                 </div>
             </div>
         </div>
