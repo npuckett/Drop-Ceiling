@@ -506,6 +506,10 @@ html, body {
     text-transform: uppercase;
 }
 
+.trends-now .now-meta.daily-total {
+    color: rgba(255, 255, 255, 0.4);
+}
+
 #trends-panels {
     display: grid;
     grid-template-rows: repeat(2, 1fr);

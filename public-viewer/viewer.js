@@ -649,6 +649,11 @@ function updateTrendStats() {
         currentPassiveEl.textContent = passive;
     }
 
+    const dailyTotalEl = document.getElementById('trend-daily-total');
+    if (dailyTotalEl) {
+        const dailyTotal = currentState?.population?.daily_total ?? 0;
+        dailyTotalEl.textContent = dailyTotal;
+    }
 }
 
 function updateTuningBars() {
