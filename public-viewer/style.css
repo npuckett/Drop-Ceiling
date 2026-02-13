@@ -17,8 +17,8 @@
     --input-passing: #66ee88;
     --output-avg: #7cd3ff;
     --output-band: rgba(124, 211, 255, 0.25);
-    --trends-height: 38vh;
-    --trends-height-desktop: 30vh;
+    --trends-height: 46vh;
+    --trends-height-desktop: 38vh;
 }
 
 html, body {
@@ -634,7 +634,7 @@ html, body {
 
 @media (max-width: 600px) {
     #trends-overlay {
-        height: 48vh;
+        height: 54vh;
         padding: 12px 12px 10px;
     }
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-3D Light Controller V2 - Development Version
+3D Light Controller V3 - Development Version
 
 This is a development version with enhanced visual debugging:
 - Origin sphere at (0,0,0) with label
@@ -98,7 +98,7 @@ WEBSOCKET_BROADCAST_INTERVAL = 0.066  # ~15 FPS for WebSocket (instead of 30)
 # Health monitoring (for 24/7 operation)
 HEALTH_LOG_INTERVAL = 300  # Log health stats every 5 minutes
 DB_PRUNE_INTERVAL = 3600  # Prune old database records every hour
-DB_RETENTION_DAYS = 7  # Keep 7 days of tracking history
+DB_RAW_RETENTION_HOURS = 48  # Keep raw events for 48 hours (aggregated to hourly_stats before deletion)
 
 # Configure logging
 logging.basicConfig(
@@ -237,6 +237,9 @@ class DailyReport:
     mode_distribution: Dict[str, float] = field(default_factory=dict)
     position_entropy: float = 0.0
     
+    # Auto-tuning strategy analysis
+    auto_tuning_analysis: Dict = field(default_factory=dict)
+    
     def to_dict(self) -> dict:
         """Convert to JSON-serializable dict"""
         return {
@@ -273,7 +276,8 @@ class DailyReport:
             'light_behavior': {
                 'mode_distribution': {k: round(v, 3) for k, v in self.mode_distribution.items()},
                 'position_entropy': round(self.position_entropy, 3),
-            }
+            },
+            'auto_tuning': self.auto_tuning_analysis,
         }
 
 
@@ -400,6 +404,14 @@ class DailyReportGenerator:
         mode_dist = self.database.get_mode_distribution(24)
         pos_entropy = self.database.get_position_entropy(60 * 24)  # Full day
         
+        # Get auto-tuning strategy analysis
+        tuning_analysis = {}
+        try:
+            tuning_analysis = self.database.get_daily_adjustments(date_str)
+        except Exception as e:
+            logger.warning(f"Auto-tuning analysis failed: {e}")
+            tuning_analysis = {'total_adjustments': 0, 'strategy_summary': 'Analysis unavailable.'}
+        
         # Create report
         report = DailyReport(
             date=date_str,
@@ -417,6 +429,7 @@ class DailyReportGenerator:
             hourly_trends=hourly_trends,
             mode_distribution=mode_dist,
             position_entropy=pos_entropy,
+            auto_tuning_analysis=tuning_analysis,
         )
         
         self.last_report = report
@@ -554,7 +567,7 @@ FPS = 30
 
 # DMX range
 DMX_MIN = 1
-DMX_MAX = 50
+DMX_MAX = 255
 
 # Panel dimensions (cm)
 PANEL_SIZE = 60
@@ -588,7 +601,7 @@ PANEL_NORMALS = {
 # Panels span from X=0 to X=-300 (right edge at 0, 4 units with 80cm spacing, panel width 60cm)
 # OPTIMIZED: Narrowed X width to match camera FOV coverage for better accuracy
 TRACKZONE = {
-    'width': 260,           # Narrowed from 475 to 260 for better coverage
+    'width': 400,           # Matched to passive zone width
     'depth': 205,
     'height': 300,
     'offset_z': 78,
@@ -610,7 +623,7 @@ PASSIVE_TRACKZONE = {
 
 # Street level Y coordinate (where tracked people are placed)
 STREET_LEVEL_Y = -66
-CAMERA_LEDGE_Y = -16  # Cameras are 50cm above street (16cm below floor)
+CAMERA_LEDGE_Y = -15  # Cameras are 51cm above street (15cm below floor)
 
 # Wander box (cm) - where the light can move
 # X range covers panels (Unit 0 at X=-30 to Unit 3 at X=-270) plus margin
@@ -671,21 +684,21 @@ CAMERA_POSITIONS = {
 # CALIBRATION MARKERS
 # =============================================================================
 
-MARKER_SIZE = 15  # cm - ArUco marker size
+MARKER_SIZE = 20  # cm - ArUco marker size
 
 # Marker positions: (X, Y, Z) in centimeters
 # Coordinate system: X=0 at back right corner of Unit 0 panel, negative X goes left
 # Marker 0 is on the RIGHT, Marker 2 is on the LEFT
 # Front row (0,1,2): 90cm from front edge of tracking zone (Z=78), so Z=168
 # Back row (3,6,4): 51cm behind front row, so Z=219
-# Marker 5: ~500cm from cameras (Z=78+500=578) on subway wall
+# Marker 5: ~550cm from cameras (Z=78+550=628) on subway wall
 MARKER_POSITIONS = {
     0: {'pos': (-30, STREET_LEVEL_Y, 168), 'desc': 'Right front', 'camera': 'Cam 1', 'vertical': False},
     1: {'pos': (-150, STREET_LEVEL_Y, 168), 'desc': 'Center front (SHARED)', 'camera': 'Both', 'vertical': False},
     2: {'pos': (-270, STREET_LEVEL_Y, 168), 'desc': 'Left front', 'camera': 'Cam 2', 'vertical': False},
     3: {'pos': (-30, STREET_LEVEL_Y, 219), 'desc': 'Right back', 'camera': 'Cam 1', 'vertical': False},
     4: {'pos': (-270, STREET_LEVEL_Y, 219), 'desc': 'Left back', 'camera': 'Cam 2', 'vertical': False},
-    5: {'pos': (-150, CAMERA_Y, 578), 'desc': 'Subway wall (VERTICAL, ~5m from cams)', 'camera': 'Both', 'vertical': True},
+    5: {'pos': (-150, CAMERA_Y, 628), 'desc': 'Subway wall (VERTICAL, ~5.5m from cams)', 'camera': 'Both', 'vertical': True},
     6: {'pos': (-150, STREET_LEVEL_Y, 219), 'desc': 'Center back (SHARED)', 'camera': 'Both', 'vertical': False},
 }
 
@@ -711,12 +724,15 @@ CAMERA_VIEW_SIZE = (320, 240)  # Size of each camera preview window
 class TrackedPerson:
     """Represents a person tracked via OSC"""
     track_id: int
+    daily_id: int
     x: float  # World X position (cm)
     z: float  # World Z position (cm)
     y: float = STREET_LEVEL_Y  # Fixed at street level
     last_update: float = 0.0
     first_seen: float = 0.0  # When first tracked
     zone: str = "unknown"  # "active", "passive", or "unknown"
+    vx: float = 0.0  # Velocity X (cm/s)
+    vz: float = 0.0  # Velocity Z (cm/s)
     
     def get_position(self) -> np.ndarray:
         return np.array([self.x, self.y, self.z])
@@ -735,6 +751,7 @@ class TrackedPersonManager:
         self.people: Dict[int, TrackedPerson] = {}
         self.lock = threading.Lock()
         self.timeout = 1.0  # Remove person after 1 second without updates
+        self.daily_count = 0
         
         # Calibration offsets and scales
         self.offset_x = 0.0
@@ -793,17 +810,22 @@ class TrackedPersonManager:
         zone = self._get_zone(x, z)
         
         now = time.time()
+        now_dt = datetime.now()
         
         with self.lock:
             is_new = track_id not in self.people
             
             if is_new:
+                self.daily_count += 1
                 self.people[track_id] = TrackedPerson(
                     track_id=track_id,
+                    daily_id=self.daily_count,
                     x=x, z=z, y=y,
                     last_update=now,
                     first_seen=now,
-                    zone=zone
+                    zone=zone,
+                    vx=0.0,
+                    vz=0.0,
                 )
                 # Notify behavior system
                 if self.on_person_entered:
@@ -811,11 +833,15 @@ class TrackedPersonManager:
                     is_active = zone == "active"
                     self.on_person_entered(track_id, pos, is_active)
             else:
-                self.people[track_id].x = x
-                self.people[track_id].z = z
-                self.people[track_id].y = y
-                self.people[track_id].zone = zone
-                self.people[track_id].last_update = now
+                person = self.people[track_id]
+                dt = max(1e-6, now - person.last_update)
+                person.vx = (x - person.x) / dt
+                person.vz = (z - person.z) / dt
+                person.x = x
+                person.z = z
+                person.y = y
+                person.zone = zone
+                person.last_update = now
                 
                 # Notify position update
                 pos = np.array([x, y, z])
@@ -837,11 +863,24 @@ class TrackedPersonManager:
                 del self.people[pid]
                 if self.on_person_left:
                     self.on_person_left(pid)
+
+    def reset_daily_population(self):
+        """Reset daily population count and reassign IDs to active people."""
+        with self.lock:
+            self.daily_count = 0
+            for person in self.people.values():
+                self.daily_count += 1
+                person.daily_id = self.daily_count
     
     def get_all(self) -> List[TrackedPerson]:
         """Get list of all tracked people"""
         with self.lock:
             return list(self.people.values())
+    
+    def get_person(self, track_id: int) -> Optional[TrackedPerson]:
+        """Get a specific tracked person by ID"""
+        with self.lock:
+            return self.people.get(track_id)
     
     def count(self) -> int:
         """Get count of tracked people"""
@@ -869,72 +908,132 @@ class TrackedPersonManager:
 # =============================================================================
 
 class WebSocketBroadcaster:
-    """Broadcasts installation state to web clients"""
+    """Broadcasts installation state to web clients with efficiency optimizations"""
     
     def __init__(self, port: int = 8765):
         self.port = port
-        self.clients = set()
+        self.clients: set = set()
+        self.clients_lock = asyncio.Lock()  # Thread-safe client management
         self.loop = None
         self.server = None
         self.thread = None
         self.current_state = {}
         self.running = False
+        self._last_json: str = ""  # Cache serialized JSON
+        self._last_state_hash: int = 0  # Track state changes
+        self._pending_broadcast: bool = False  # Coalesce rapid updates
     
     async def handler(self, websocket):
-        """Handle a WebSocket connection"""
-        self.clients.add(websocket)
+        """Handle a WebSocket connection with ping/pong heartbeat"""
+        async with self.clients_lock:
+            self.clients.add(websocket)
+        
         client_ip = websocket.remote_address[0] if hasattr(websocket, 'remote_address') else 'unknown'
-        print(f"🌐 WebSocket client connected: {client_ip}")
+        logger.info(f"WebSocket client connected: {client_ip} (total: {len(self.clients)})")
         
         try:
             # Send current state immediately
-            if self.current_state:
-                await websocket.send(json.dumps(self.current_state))
+            if self._last_json:
+                await websocket.send(self._last_json)
             
-            # Keep connection alive
+            # Keep connection alive with ping/pong (handled by websockets library)
             async for message in websocket:
-                pass  # We don't expect messages from clients
-        except websockets.exceptions.ConnectionClosed:
-            pass
+                # Handle any client messages (e.g., request full report refresh)
+                try:
+                    data = json.loads(message)
+                    if data.get('type') == 'request_report' and self._last_json:
+                        await websocket.send(self._last_json)
+                except json.JSONDecodeError:
+                    pass  # Ignore malformed messages
+                    
+        except websockets.exceptions.ConnectionClosed as e:
+            logger.debug(f"WebSocket connection closed: {client_ip} (code: {e.code})")
+        except Exception as e:
+            logger.warning(f"WebSocket handler error for {client_ip}: {e}")
         finally:
-            self.clients.discard(websocket)
-            print(f"🌐 WebSocket client disconnected: {client_ip}")
+            async with self.clients_lock:
+                self.clients.discard(websocket)
+            logger.info(f"WebSocket client disconnected: {client_ip} (remaining: {len(self.clients)})")
     
-    async def broadcast(self, state: dict):
-        """Broadcast state to all connected clients"""
-        if not self.clients:
+    async def broadcast(self):
+        """Broadcast cached state to all connected clients"""
+        if not self.clients or not self._last_json:
             return
         
-        message = json.dumps(state)
-        # Send to all clients, removing dead connections
-        dead_clients = set()
-        for client in self.clients:
-            try:
-                await client.send(message)
-            except:
-                dead_clients.add(client)
+        # Get snapshot of clients under lock
+        async with self.clients_lock:
+            clients_snapshot = list(self.clients)
         
-        self.clients -= dead_clients
+        if not clients_snapshot:
+            return
+        
+        # Broadcast to all clients concurrently
+        dead_clients = []
+        
+        async def send_to_client(client):
+            try:
+                await asyncio.wait_for(client.send(self._last_json), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning("WebSocket send timeout, marking client dead")
+                dead_clients.append(client)
+            except websockets.exceptions.ConnectionClosed:
+                dead_clients.append(client)
+            except Exception as e:
+                logger.debug(f"WebSocket send error: {e}")
+                dead_clients.append(client)
+        
+        # Send concurrently to all clients
+        await asyncio.gather(*[send_to_client(c) for c in clients_snapshot], return_exceptions=True)
+        
+        # Remove dead clients
+        if dead_clients:
+            async with self.clients_lock:
+                for client in dead_clients:
+                    self.clients.discard(client)
     
     def update_state(self, state: dict):
-        """Update the current state (called from main thread)"""
+        """Update the current state (called from main thread) - optimized"""
+        # Compute simple hash to detect meaningful changes
+        population = state.get('population', {})
+        state_hash = hash((
+            state.get('mode'),
+            len(state.get('people', [])),
+            state.get('report_version', 0),
+            state.get('auto_tuning', {}).get('revision', 0),
+            int(state.get('light', {}).get('x', 0) * 10),
+            int(state.get('light', {}).get('y', 0) * 10),
+            population.get('daily_total', 0),
+            population.get('current', 0),
+        ))
+        
+        # Only re-serialize if state actually changed
+        if state_hash != self._last_state_hash:
+            self._last_state_hash = state_hash
+            self._last_json = json.dumps(state, separators=(',', ':'))  # Compact JSON
+        
         self.current_state = state
         
-        if self.loop and self.running:
-            # Schedule broadcast on the event loop
-            asyncio.run_coroutine_threadsafe(
-                self.broadcast(state),
-                self.loop
-            )
+        if self.loop and self.running and not self._pending_broadcast:
+            self._pending_broadcast = True
+            
+            async def do_broadcast():
+                self._pending_broadcast = False
+                await self.broadcast()
+            
+            asyncio.run_coroutine_threadsafe(do_broadcast(), self.loop)
     
     async def _run_server(self):
-        """Run the WebSocket server"""
+        """Run the WebSocket server with optimized settings"""
         self.server = await websockets.serve(
             self.handler,
             "0.0.0.0",
-            self.port
+            self.port,
+            ping_interval=20,  # Send ping every 20s
+            ping_timeout=10,   # Wait 10s for pong
+            close_timeout=5,   # Allow 5s for graceful close
+            max_size=2**20,    # 1MB max message size
         )
-        print(f"🌐 WebSocket server started on port {self.port}")
+        logger.info(f"WebSocket server started on port {self.port}")
         
         # Get local IP for display
         try:
@@ -943,7 +1042,7 @@ class WebSocketBroadcaster:
             local_ip = s.getsockname()[0]
             s.close()
             print(f"   Public viewer URL: http://{local_ip}:8080")
-        except:
+        except Exception:
             print(f"   Public viewer: connect to port {self.port}")
         
         await self.server.wait_closed()
@@ -960,17 +1059,30 @@ class WebSocketBroadcaster:
             
             try:
                 self.loop.run_until_complete(self._run_server())
+            except OSError as e:
+                # Port already in use, etc.
+                restart_count += 1
+                logger.error(f"WebSocket server OS error ({restart_count}/{max_restarts}): {e}")
+                if restart_count < max_restarts and self.running:
+                    logger.info(f"WebSocket server restarting in {restart_delay}s...")
+                    time.sleep(restart_delay)
+                    restart_delay = min(restart_delay * 2, 60)
             except Exception as e:
                 restart_count += 1
                 logger.error(f"WebSocket server error ({restart_count}/{max_restarts}): {e}")
-                if restart_count < max_restarts:
+                if restart_count < max_restarts and self.running:
                     logger.info(f"WebSocket server restarting in {restart_delay}s...")
                     time.sleep(restart_delay)
-                    restart_delay = min(restart_delay * 2, 60)  # Exponential backoff, max 60s
+                    restart_delay = min(restart_delay * 2, 60)
             finally:
                 try:
+                    # Clean up pending tasks
+                    pending = asyncio.all_tasks(self.loop)
+                    for task in pending:
+                        task.cancel()
+                    self.loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
                     self.loop.close()
-                except:
+                except Exception:
                     pass
         
         if restart_count >= max_restarts:
@@ -980,14 +1092,468 @@ class WebSocketBroadcaster:
     def start(self):
         """Start the WebSocket server in a background thread"""
         self.running = True  # Set BEFORE starting thread
-        self.thread = threading.Thread(target=self._thread_main, daemon=True)
+        self.thread = threading.Thread(target=self._thread_main, daemon=True, name="WebSocketServer")
         self.thread.start()
     
     def stop(self):
-        """Stop the WebSocket server"""
+        """Stop the WebSocket server gracefully"""
         self.running = False
         if self.server:
             self.server.close()
+        if self.loop and self.loop.is_running():
+            # Schedule cleanup on the event loop
+            async def cleanup():
+                async with self.clients_lock:
+                    for client in list(self.clients):
+                        try:
+                            await asyncio.wait_for(client.close(), timeout=2.0)
+                        except Exception:
+                            pass
+                    self.clients.clear()
+            try:
+                asyncio.run_coroutine_threadsafe(cleanup(), self.loop)
+            except Exception:
+                pass
+
+
+# =============================================================================
+# AUTO TUNING (trend-responsive behavior adjustments)
+# =============================================================================
+
+@dataclass
+class AutoTuningConfig:
+    update_interval: float = 5.0
+    min_step: float = 0.002
+    max_step_personality: float = 0.03
+    max_step_global: float = 0.08
+    target_activity: float = 0.5
+    damping_strong: float = 0.4
+    damping_moderate: float = 0.7
+    budget_cost_scale: float = 40.0
+
+
+class AutoTuningManager:
+    def __init__(self, meta: MetaParameters, sliders: dict, database: TrackingDatabase = None):
+        self.meta = meta
+        self.sliders = sliders
+        self.database = database
+        self.config = AutoTuningConfig()
+        self.enabled = True
+        self.last_update = 0.0
+        self.last_adjustment: Optional[dict] = None
+        self.revision = 0
+        self.history: List[dict] = []
+        self.budget_current = 60.0
+        self.budget_last_time = time.time()
+
+        self.param_order = [
+            'responsiveness', 'energy', 'attention_span', 'sociability',
+            'exploration', 'memory', 'brightness_global', 'speed_global',
+            'pulse_global', 'follow_speed_global', 'dwell_influence',
+            'idle_trend_weight'
+        ]
+
+        self.min_vals = {
+            'responsiveness': 0.0,
+            'energy': 0.0,
+            'attention_span': 0.0,
+            'sociability': 0.0,
+            'exploration': 0.0,
+            'memory': 0.0,
+            'brightness_global': 0.2,
+            'speed_global': 0.2,
+            'pulse_global': 0.3,
+            'follow_speed_global': 0.5,
+            'dwell_influence': 0.0,
+            'idle_trend_weight': 0.0,
+        }
+
+        self.max_vals = {
+            'responsiveness': 1.0,
+            'energy': 1.0,
+            'attention_span': 1.0,
+            'sociability': 1.0,
+            'exploration': 1.0,
+            'memory': 1.0,
+            'brightness_global': 5.0,
+            'speed_global': 2.0,
+            'pulse_global': 3.0,
+            'follow_speed_global': 3.0,
+            'dwell_influence': 2.0,
+            'idle_trend_weight': 2.0,
+        }
+
+        # Soft caps to avoid obnoxious behavior
+        self.caps = {
+            'brightness_global': 3.0,
+            'speed_global': 1.6,
+            'pulse_global': 2.0,
+            'energy': 0.85,
+            'responsiveness': 0.9,
+        }
+        
+        # Safe minimums — auto-tuner cannot push below these
+        # Prevents the "crash to floor" problem when activity is persistently high
+        self.safe_floors = {
+            'responsiveness': 0.15,
+            'energy': 0.10,
+            'brightness_global': 0.6,
+            'speed_global': 0.3,
+            'pulse_global': 0.3,
+            'follow_speed_global': 0.5,
+            'exploration': 0.05,
+            'sociability': 0.05,
+        }
+        
+        # Learned biases from previous days' reports (loaded from DB)
+        self.learned_starting_values: Dict[str, float] = {}
+        self.learned_caps_adjustments: Dict[str, float] = {}
+        self.days_of_learning: int = 0
+
+    def set_enabled(self, enabled: bool):
+        self.enabled = enabled
+    
+    def load_learnings_from_db(self):
+        """
+        Load historical auto-tune learnings from the database.
+        Uses the last 7 days of data to compute weighted optimal starting values
+        and any learned cap adjustments.
+        """
+        if not self.database:
+            return
+        
+        try:
+            learnings = self.database.get_recent_autotune_learnings(days=7)
+            if not learnings:
+                logger.info("🧠 No previous auto-tune learnings found")
+                return
+            
+            self.days_of_learning = len(learnings)
+            
+            # Compute weighted average of optimal values from recent days
+            # More recent days get higher weight
+            weighted_values: Dict[str, float] = {}
+            weight_counts: Dict[str, float] = {}
+            
+            for i, day in enumerate(learnings):
+                # Weight: most recent = 1.0, oldest = 0.3
+                weight = 1.0 - (i * 0.1)
+                weight = max(0.3, weight)
+                
+                optimal = day.get('optimal_values', {})
+                for name, val in optimal.items():
+                    if name in self.param_order:
+                        weighted_values[name] = weighted_values.get(name, 0.0) + val * weight
+                        weight_counts[name] = weight_counts.get(name, 0.0) + weight
+            
+            # Compute averages
+            for name in weighted_values:
+                if weight_counts.get(name, 0) > 0:
+                    self.learned_starting_values[name] = weighted_values[name] / weight_counts[name]
+            
+            # Merge any learned cap adjustments from the most recent day
+            if learnings:
+                most_recent_caps = learnings[0].get('learned_caps', {})
+                self.learned_caps_adjustments = most_recent_caps
+            
+            if self.learned_starting_values:
+                logger.info(f"🧠 Loaded auto-tune learnings from {self.days_of_learning} days")
+                top3 = sorted(self.learned_starting_values.items(), 
+                             key=lambda kv: abs(kv[1] - self._get_values().get(kv[0], 0.5)))[:3]
+                for name, val in top3:
+                    current = self._get_values().get(name, 0.5)
+                    logger.info(f"   {name}: learned={val:.3f} current={current:.3f}")
+        except Exception as e:
+            logger.warning(f"Failed to load auto-tune learnings: {e}")
+    
+    def apply_learnings_to_values(self):
+        """
+        Blend learned optimal values with current slider values.
+        Only applies if learnings exist and values differ meaningfully.
+        Uses a gentle blend (30% learned, 70% current) to avoid jarring changes.
+        """
+        if not self.learned_starting_values:
+            return
+        
+        current = self._get_values()
+        blended = {}
+        blend_factor = min(0.3, 0.1 * self.days_of_learning)  # More data = more confidence, max 30%
+        
+        for name, learned_val in self.learned_starting_values.items():
+            current_val = current.get(name)
+            if current_val is None:
+                continue
+            
+            # Only blend if there's a meaningful difference
+            diff = abs(learned_val - current_val)
+            if diff < 0.01:
+                continue
+            
+            new_val = current_val * (1 - blend_factor) + learned_val * blend_factor
+            new_val = self._clamp(name, new_val)
+            blended[name] = new_val
+        
+        if blended:
+            self._apply_values(blended)
+            logger.info(f"🧠 Applied learned values to {len(blended)} params (blend={blend_factor:.0%})")
+    
+    def compute_daily_learnings(self, report) -> Dict:
+        """
+        Analyze a daily report and extract learnings for future auto-tuning.
+        Computes optimal starting values based on end-of-day parameter positions
+        and parameter journey analysis.
+        
+        Args:
+            report: DailyReport instance
+            
+        Returns:
+            Dict with optimal_values and learned_caps
+        """
+        tuning = report.auto_tuning_analysis
+        journeys = tuning.get('param_journeys', {})
+        
+        if not journeys:
+            return {'optimal_values': {}, 'learned_caps': {}}
+        
+        # The "optimal" values are where each parameter settled by end of day
+        # weighted by how much the tuner moved them (more movement = more confidence)
+        optimal_values = {}
+        for name, journey in journeys.items():
+            if name not in self.param_order:
+                continue
+            
+            end_val = journey.get('end', None)
+            if end_val is None:
+                continue
+            
+            # Use the end-of-day value as the optimal starting point
+            # But bias toward the middle of the range it explored
+            min_val = journey.get('min', end_val)
+            max_val = journey.get('max', end_val)
+            midpoint = (min_val + max_val) / 2.0
+            
+            # Blend: 60% end value (where it settled) + 40% midpoint (where it explored)
+            optimal = end_val * 0.6 + midpoint * 0.4
+            optimal_values[name] = round(optimal, 4)
+        
+        # Learn cap adjustments: if a param consistently hit its cap,
+        # and the tuner kept pushing, consider loosening the cap
+        learned_caps = dict(self.caps)  # Start from current caps
+        for name, journey in journeys.items():
+            if name not in self.caps:
+                continue
+            current_cap = self.caps[name]
+            end_val = journey.get('end', 0)
+            max_val = journey.get('max', 0)
+            
+            # If the param spent time at or near the cap, nudge cap up slightly
+            if max_val >= current_cap * 0.95 and journey.get('direction') == 'up':
+                learned_caps[name] = round(min(current_cap * 1.1, self.max_vals.get(name, current_cap)), 3)
+        
+        return {
+            'optimal_values': optimal_values,
+            'learned_caps': learned_caps,
+        }
+
+    def _get_values(self) -> dict:
+        return {name: float(getattr(self.meta, name)) for name in self.param_order}
+
+    def _budget_max(self) -> float:
+        slider = self.sliders.get('interaction_budget')
+        if slider is None:
+            return 60.0
+        return max(0.0, float(slider.value))
+
+    def _apply_values(self, new_values: dict):
+        for name, value in new_values.items():
+            setattr(self.meta, name, value)
+            if name in self.sliders:
+                self.sliders[name].value = value
+
+    def _clamp(self, name: str, value: float) -> float:
+        max_val = min(self.max_vals.get(name, 1.0), self.caps.get(name, self.max_vals.get(name, 1.0)))
+        min_val = max(self.min_vals.get(name, 0.0), self.safe_floors.get(name, 0.0))
+        return max(min_val, min(max_val, value))
+
+    def update(self, behavior_status: dict, now: float) -> Optional[dict]:
+        budget_max = self._budget_max()
+        dt_budget = max(0.0, now - self.budget_last_time)
+        if dt_budget > 0:
+            restore_rate = budget_max / 120.0 if budget_max > 0 else 0.0
+            aggression = behavior_status.get('aggression', {})
+            engagement_bonus = budget_max / 45.0 if aggression.get('current_engagement') else 0.0
+            self.budget_current = min(budget_max, self.budget_current + dt_budget * (restore_rate + engagement_bonus))
+            self.budget_last_time = now
+
+        if not self.enabled or budget_max <= 0:
+            return None
+
+        if now - self.last_update < self.config.update_interval:
+            return None
+
+        idle_trends = behavior_status.get('idle_trends', {})
+        if not idle_trends or not idle_trends.get('has_short', False):
+            return None
+
+        short_activity = float(idle_trends.get('short_activity', 0.0))
+        medium_activity = float(idle_trends.get('medium_activity', short_activity))
+        long_activity = float(idle_trends.get('long_activity', medium_activity))
+        energy_level = float(idle_trends.get('energy_level', 0.5))
+
+        aggression = behavior_status.get('aggression', {})
+        aggression_level = float(aggression.get('level', 0.0))
+        seconds_since_eng = float(aggression.get('seconds_since_engagement', 9999))
+
+        damping = 1.0
+        if aggression_level > 0.8 or seconds_since_eng < 10:
+            damping = self.config.damping_strong
+        elif aggression_level > 0.6:
+            damping = self.config.damping_moderate
+
+        target = self.config.target_activity
+        need_short = max(-0.4, min(0.4, target - short_activity))
+        need_medium = max(-0.4, min(0.4, target - medium_activity))
+        need_long = max(-0.4, min(0.4, target - long_activity))
+        combined_need = 0.5 * need_short + 0.3 * need_medium + 0.2 * need_long
+
+        deltas = {
+            'responsiveness': combined_need * 0.08 * damping,
+            'sociability': combined_need * 0.07 * damping,
+            'follow_speed_global': combined_need * 0.12 * damping,
+            'energy': combined_need * 0.06 * damping,
+            'brightness_global': need_long * 0.10 * damping,
+            'speed_global': need_short * 0.07 * damping,
+            'pulse_global': need_short * 0.06 * damping,
+        }
+
+        if medium_activity < 0.4:
+            deltas['exploration'] = (0.4 - medium_activity) * 0.10 * damping
+            deltas['attention_span'] = (0.4 - medium_activity) * 0.08 * damping
+        elif medium_activity > 0.75:
+            deltas['exploration'] = -(medium_activity - 0.75) * 0.08 * damping
+            deltas['attention_span'] = (medium_activity - 0.75) * 0.04 * damping
+
+        deltas['memory'] = (long_activity - 0.5) * 0.04 * damping
+        deltas['dwell_influence'] = (energy_level - 0.5) * 0.04 * damping
+        deltas['idle_trend_weight'] = (0.5 - short_activity) * 0.04 * damping
+
+        old_values = self._get_values()
+        new_values = dict(old_values)
+        applied = {}
+
+        for name, delta in deltas.items():
+            max_step = self.config.max_step_personality if name in (
+                'responsiveness', 'energy', 'attention_span', 'sociability',
+                'exploration', 'memory'
+            ) else self.config.max_step_global
+            if delta > max_step:
+                delta = max_step
+            elif delta < -max_step:
+                delta = -max_step
+
+            if abs(delta) < self.config.min_step:
+                continue
+
+            new_val = self._clamp(name, old_values[name] + delta)
+            applied_delta = new_val - old_values[name]
+            if abs(applied_delta) < self.config.min_step:
+                continue
+
+            new_values[name] = new_val
+            applied[name] = applied_delta
+
+        if not applied:
+            return None
+
+        raw_cost = sum(abs(val) for val in applied.values()) * self.config.budget_cost_scale
+        scale = 1.0
+        if raw_cost > self.budget_current and raw_cost > 0:
+            scale = max(0.0, self.budget_current / raw_cost)
+
+        if scale < 1.0:
+            new_values = dict(old_values)
+            applied = {}
+            for name, delta in deltas.items():
+                max_step = self.config.max_step_personality if name in (
+                    'responsiveness', 'energy', 'attention_span', 'sociability',
+                    'exploration', 'memory'
+                ) else self.config.max_step_global
+                delta = max(-max_step, min(max_step, delta * scale))
+                if abs(delta) < self.config.min_step:
+                    continue
+                new_val = self._clamp(name, old_values[name] + delta)
+                applied_delta = new_val - old_values[name]
+                if abs(applied_delta) < self.config.min_step:
+                    continue
+                new_values[name] = new_val
+                applied[name] = applied_delta
+
+            if not applied:
+                return None
+
+        self._apply_values(new_values)
+        self.last_update = now
+        self.revision += 1
+
+        cost_used = sum(abs(val) for val in applied.values()) * self.config.budget_cost_scale
+        budget_before = self.budget_current
+        self.budget_current = max(0.0, self.budget_current - cost_used)
+
+        adjustment = {
+            'timestamp': now,
+            'revision': self.revision,
+            'enabled': self.enabled,
+            'short_activity': short_activity,
+            'medium_activity': medium_activity,
+            'long_activity': long_activity,
+            'energy_level': energy_level,
+            'aggression_level': aggression_level,
+            'seconds_since_engagement': seconds_since_eng,
+            'damping': damping,
+            'budget_before': budget_before,
+            'budget_after': self.budget_current,
+            'budget_max': budget_max,
+            'budget_cost': cost_used,
+            'old_values': old_values,
+            'new_values': new_values,
+            'applied_deltas': applied,
+            'caps': self.caps,
+        }
+
+        self.last_adjustment = adjustment
+        top_deltas = sorted(applied.items(), key=lambda kv: abs(kv[1]), reverse=True)[:3]
+        
+        # Debug print for monitoring
+        delta_str = ', '.join(f"{n}:{d:+.3f}" for n, d in top_deltas)
+        print(f"🎛️  Auto-tune #{self.revision}: activity={short_activity:.2f}/{medium_activity:.2f} → {delta_str}")
+        
+        self.history.append({
+            'timestamp': now,
+            'short_activity': short_activity,
+            'medium_activity': medium_activity,
+            'long_activity': long_activity,
+            'deltas': top_deltas,
+        })
+        if len(self.history) > 8:
+            self.history = self.history[-8:]
+
+        if self.database:
+            try:
+                self.database.record_behavior_adjustment(
+                    enabled=self.enabled,
+                    reason='auto_tune',
+                    short_activity=short_activity,
+                    medium_activity=medium_activity,
+                    long_activity=long_activity,
+                    energy_level=energy_level,
+                    aggression_level=aggression_level,
+                    adjustments=adjustment,
+                    timestamp=now
+                )
+            except Exception as e:
+                logger.warning(f"Auto-tune adjustment log failed: {e}")
+
+        return adjustment
 
 
 # =============================================================================
@@ -1015,9 +1581,12 @@ class OSCHandler:
                 x, z = float(args[0]), float(args[1])
                 self.manager.update_person(track_id, x, z)
                 
-                # Record to database
+                # Record to database using CALIBRATED position (not raw)
+                # This ensures database zone classifications match real-time display
                 if self.database:
-                    self.database.record_position(track_id, x, z)
+                    person = self.manager.get_person(track_id)
+                    if person:
+                        self.database.record_position(track_id, person.x, person.z)
                 
                 # Debug output every 2 seconds
                 self.message_count += 1
@@ -1107,8 +1676,14 @@ class PanelSystem:
             diff = panel['center'] - light.position
             distance = np.linalg.norm(diff)
             
+            if light.falloff_radius > 0 and distance > light.falloff_radius:
+                # Outside the radius — panel is off
+                panel['brightness'] = 0.0
+                panel['dmx_value'] = DMX_MIN
+                continue
+            
             if light.falloff_radius > 0:
-                falloff = max(0, 1.0 - distance / light.falloff_radius)
+                falloff = 1.0 - distance / light.falloff_radius
             else:
                 falloff = 1.0
             
@@ -1256,15 +1831,21 @@ def draw_box_wireframe(bounds, color):
 
 
 def draw_panel(center, angle, size, brightness):
-    """Draw a panel as a quad"""
+    """Draw a panel as a quad. Brightness is 0.0-1.0 float from panel system."""
     half = size / 2
     
     glPushMatrix()
     glTranslatef(*center)
     glRotatef(-angle, 1, 0, 0)
     
-    gray = 0.2 + brightness * 0.8
-    glColor4f(gray, gray, gray, 1.0)
+    # Panel face: dark base + warm white proportional to brightness
+    # V2-style: simple 0.2 + brightness * 0.8 mapping
+    b = max(0.0, min(1.0, brightness))
+    base = 0.08
+    r = base + b * 0.92  # Warm white: slightly more red
+    g = base + b * 0.88
+    bl = base + b * 0.78  # Less blue for warm LED look
+    glColor4f(r, g, bl, 1.0)
     
     glBegin(GL_QUADS)
     glVertex3f(-half, -half, 0)
@@ -1273,7 +1854,21 @@ def draw_panel(center, angle, size, brightness):
     glVertex3f(-half, half, 0)
     glEnd()
     
-    glColor4f(0.3, 0.3, 0.3, 1.0)
+    # Additive glow quad (slightly larger, semi-transparent)
+    if b > 0.05:
+        glow_half = half * (1.0 + b * 0.15)  # Grow slightly with brightness
+        glow_alpha = b * 0.25
+        glColor4f(1.0, 0.95, 0.8, glow_alpha)
+        glBegin(GL_QUADS)
+        glVertex3f(-glow_half, -glow_half, 0.5)
+        glVertex3f(glow_half, -glow_half, 0.5)
+        glVertex3f(glow_half, glow_half, 0.5)
+        glVertex3f(-glow_half, glow_half, 0.5)
+        glEnd()
+    
+    # Border frame
+    frame_brightness = 0.2 + b * 0.3
+    glColor4f(frame_brightness, frame_brightness, frame_brightness, 1.0)
     glLineWidth(2)
     glBegin(GL_LINE_LOOP)
     glVertex3f(-half, -half, 0)
@@ -1376,6 +1971,42 @@ def draw_tracked_person(person: TrackedPerson, zone_checker=None):
     
     gluDeleteQuadric(quadric)
     glPopMatrix()
+    
+    # Draw population ID label above head
+    label_pos = np.array([pos[0], pos[1] + height + radius + 10, pos[2]])
+    # Project 3D position to screen using current matrices
+    modelview = glGetDoublev(GL_MODELVIEW_MATRIX)
+    projection = glGetDoublev(GL_PROJECTION_MATRIX)
+    viewport = glGetIntegerv(GL_VIEWPORT)
+    try:
+        sx, sy, sz = gluProject(label_pos[0], label_pos[1], label_pos[2],
+                                modelview, projection, viewport)
+        if sz > 0 and sz < 1:  # Visible (in front of camera)
+            label = f"#{person.daily_id}"
+            _id_font = pygame.font.SysFont('monospace', 16, bold=True)
+            text_surface = _id_font.render(label, True, (255, 255, 255))
+            text_data = pygame.image.tostring(text_surface, "RGBA", True)
+            glDisable(GL_DEPTH_TEST)
+            glWindowPos2d(int(sx) - text_surface.get_width() // 2, int(sy))
+            glDrawPixels(text_surface.get_width(), text_surface.get_height(),
+                         GL_RGBA, GL_UNSIGNED_BYTE, text_data)
+            glEnable(GL_DEPTH_TEST)
+    except Exception:
+        pass  # Skip if projection fails
+
+    # Draw velocity vector (scaled)
+    speed = math.sqrt(person.vx ** 2 + person.vz ** 2)
+    if speed > 5:
+        vec_scale = 0.2
+        vx = person.vx * vec_scale
+        vz = person.vz * vec_scale
+        glLineWidth(2)
+        glColor4f(color[0], color[1], color[2], 0.9)
+        glBegin(GL_LINES)
+        glVertex3f(pos[0], pos[1] + 10, pos[2])
+        glVertex3f(pos[0] + vx, pos[1] + 10, pos[2] + vz)
+        glEnd()
+        glLineWidth(1)
 
 
 def draw_floor(y_level, color, z_max=None):
@@ -1447,9 +2078,12 @@ def draw_trends_visualization(report: 'DailyReport', x: int, y: int, width: int,
     chart_width = width - 70
     chart_height = height - 100
     
-    # Find max value for scaling
-    max_people = max(h.total_people for h in report.hourly_trends) if report.hourly_trends else 1
-    max_people = max(max_people, 1)  # Avoid division by zero
+    # Find max values for scaling - use separate scales for active and passive
+    # Active counts are typically much lower than passive
+    max_active = max((h.active_count for h in report.hourly_trends), default=1) or 1
+    max_passive = max((h.passive_count for h in report.hourly_trends), default=1) or 1
+    # Use combined max for stacked bars, with minimum thresholds for visibility
+    max_combined = max(max_active + max_passive // 3, 10)  # Minimum scale of 10
     
     # Draw hour bars
     bar_width = chart_width / 24
@@ -1459,8 +2093,8 @@ def draw_trends_visualization(report: 'DailyReport', x: int, y: int, width: int,
         hour = trend.hour
         bx = chart_x + hour * bar_width
         
-        # Active zone bar (green)
-        active_height = (trend.active_count / max(max_people, 1)) * chart_height * 0.8
+        # Active zone bar (green) - scale to fill ~40% of chart max
+        active_height = (trend.active_count / max_combined) * chart_height * 0.8
         glColor4f(0.2, 0.7, 0.3, 0.8)
         glBegin(GL_QUADS)
         glVertex2f(bx + bar_gap, chart_y)
@@ -1469,8 +2103,8 @@ def draw_trends_visualization(report: 'DailyReport', x: int, y: int, width: int,
         glVertex2f(bx + bar_gap, chart_y + active_height)
         glEnd()
         
-        # Passive zone bar (stacked, blue)
-        passive_height = (trend.passive_count / max(max_people * 3, 1)) * chart_height * 0.8
+        # Passive zone bar (stacked, blue) - scale down since passive >> active
+        passive_height = (trend.passive_count / 3 / max_combined) * chart_height * 0.8
         glColor4f(0.3, 0.3, 0.7, 0.8)
         glBegin(GL_QUADS)
         glVertex2f(bx + bar_gap, chart_y + active_height)
@@ -1550,6 +2184,110 @@ def draw_trends_visualization(report: 'DailyReport', x: int, y: int, width: int,
     draw_text_2d(x + width - 80, y + 10, "T to close", font_small, (120, 120, 120))
 
 
+def draw_auto_tuning_panel(x: int, y: int, width: int, height: int, font, font_small,
+                           enabled: bool, last_adjustment: Optional[dict], history: List[dict],
+                           budget_current: float, budget_max: float):
+    """Draw a compact auto-tuning status panel with latest adjustment and history."""
+    glColor4f(0.08, 0.08, 0.12, 0.9)
+    glBegin(GL_QUADS)
+    glVertex2f(x, y)
+    glVertex2f(x + width, y)
+    glVertex2f(x + width, y + height)
+    glVertex2f(x, y + height)
+    glEnd()
+
+    glColor4f(0.3, 0.4, 0.6, 0.8)
+    glLineWidth(1)
+    glBegin(GL_LINE_LOOP)
+    glVertex2f(x, y)
+    glVertex2f(x + width, y)
+    glVertex2f(x + width, y + height)
+    glVertex2f(x, y + height)
+    glEnd()
+
+    status_color = (100, 255, 100) if enabled else (180, 180, 180)
+    status_text = "ON" if enabled else "OFF"
+    draw_text_2d(x + 10, y + height - 18, "AUTO TUNE", font, (120, 200, 255))
+    draw_text_2d(x + width - 50, y + height - 18, status_text, font_small, status_color)
+
+    budget_ratio = budget_current / budget_max if budget_max > 0 else 0.0
+    budget_bar = "#" * int(budget_ratio * 12) + "." * (12 - int(budget_ratio * 12))
+    draw_text_2d(
+        x + 10,
+        y + height - 36,
+        f"Budget [{budget_bar}] {budget_current:.0f}/{budget_max:.0f}",
+        font_small,
+        (180, 180, 180)
+    )
+
+    if not last_adjustment:
+        draw_text_2d(x + 10, y + height - 54, "No adjustments yet", font_small, (150, 150, 150))
+        return
+
+    now = time.time()
+    age = max(0.0, now - last_adjustment.get('timestamp', now))
+    short_act = last_adjustment.get('short_activity', 0.0)
+    med_act = last_adjustment.get('medium_activity', 0.0)
+    long_act = last_adjustment.get('long_activity', 0.0)
+    damping = last_adjustment.get('damping', 1.0)
+
+    # Split into two shorter lines to fit column
+    draw_text_2d(x + 10, y + height - 54, f"Last: {age:.0f}s ago  Damp:{damping:.2f}", font_small, (180, 180, 180))
+    draw_text_2d(x + 10, y + height - 68, f"S:{short_act:.2f} M:{med_act:.2f} L:{long_act:.2f}", font_small, (160, 160, 160))
+
+    label_map = {
+        'responsiveness': 'resp',
+        'energy': 'enrg',
+        'attention_span': 'attn',
+        'sociability': 'socl',
+        'exploration': 'expl',
+        'memory': 'mem',
+        'brightness_global': 'brit',
+        'speed_global': 'spd',
+        'pulse_global': 'puls',
+        'follow_speed_global': 'fllw',
+        'dwell_influence': 'dwel',
+        'idle_trend_weight': 'idle',
+    }
+
+    deltas = last_adjustment.get('applied_deltas', {})
+    # Show all deltas, sorted by magnitude
+    all_deltas = sorted(deltas.items(), key=lambda kv: abs(kv[1]), reverse=True)
+    
+    # Current values section
+    draw_text_2d(x + 10, y + height - 86, "Adjustments:", font_small, (120, 200, 120))
+    delta_y = y + height - 102
+    for k, v in all_deltas:
+        color = (120, 220, 120) if v > 0 else (220, 120, 120)
+        draw_text_2d(x + 10, delta_y, f" {label_map.get(k, k):>4s} {v:+.3f}", font_small, color)
+        delta_y -= 14
+        if delta_y < y + 40:  # Don't overflow past bottom
+            break
+
+    # History section - use remaining space
+    if delta_y > y + 30:
+        delta_y -= 8
+        draw_text_2d(x + 10, delta_y, "History:", font_small, (140, 140, 180))
+        delta_y -= 16
+        max_history = min(8, len(history))
+        for item in reversed(history[-max_history:]):
+            h_age = max(0.0, now - item.get('timestamp', now))
+            h_deltas = item.get('deltas', [])
+            if not h_deltas:
+                continue
+            # One delta per line to stay within column
+            first = True
+            for k, v in h_deltas:
+                prefix = f"{h_age:3.0f}s " if first else "     "
+                first = False
+                draw_text_2d(x + 10, delta_y, f"{prefix}{label_map.get(k, k):>4s}{v:+.2f}", font_small, (140, 140, 160))
+                delta_y -= 14
+                if delta_y < y + 10:
+                    break
+            if delta_y < y + 10:
+                break
+
+
 def draw_realtime_trends(idle_trends: dict, x: int, y: int, font, font_small, aggression: dict = None, flow: dict = None, almost_engaged: dict = None, feedback_learning: dict = None):
     """
     Draw real-time trends panel on the left side of the screen.
@@ -1568,7 +2306,7 @@ def draw_realtime_trends(idle_trends: dict, x: int, y: int, font, font_small, ag
         return
     
     panel_width = 260
-    panel_height = 640  # Increased height for feedback learning display
+    panel_height = 520  # Reduced height - content is more compact now
     
     # Background panel
     glColor4f(0.08, 0.08, 0.12, 0.85)
@@ -1597,8 +2335,9 @@ def draw_realtime_trends(idle_trends: dict, x: int, y: int, font, font_small, ag
     update_color = (100, 255, 100) if seconds_since < 6 else (255, 200, 100) if seconds_since < 15 else (255, 100, 100)
     draw_text_2d(x + 130, y - 18, f"({seconds_since:.1f}s ago)", font_small, update_color)
     
-    curr_y = y - 40
-    line_height = 16
+    curr_y = y - 35
+    line_height = 14  # Reduced from 16 for more compact display
+    min_y = y - panel_height + 15  # Stop drawing before going off panel
     
     # Period indicator
     period = idle_trends.get('period', 'unknown')
@@ -1610,7 +2349,7 @@ def draw_realtime_trends(idle_trends: dict, x: int, y: int, font, font_small, ag
     }
     period_color = period_colors.get(period, (150, 150, 150))
     draw_text_2d(x + 10, curr_y, f"Period: {period.upper()}", font_small, period_color)
-    curr_y -= line_height + 5
+    curr_y -= line_height + 3
     
     # Database error if any
     db_error = idle_trends.get('database_error', '')
@@ -1619,6 +2358,7 @@ def draw_realtime_trends(idle_trends: dict, x: int, y: int, font, font_small, ag
         curr_y -= line_height
     
     # Section: REALTIME (1 min)
+    if curr_y < min_y: return
     has_recent = idle_trends.get('has_recent', False)
     status_char = "●" if has_recent else "○"
     status_color = (100, 255, 100) if has_recent else (100, 100, 100)
@@ -1676,19 +2416,19 @@ def draw_realtime_trends(idle_trends: dict, x: int, y: int, font, font_small, ag
     status_char = "●" if has_hist else "○"
     status_color = (100, 255, 100) if has_hist else (100, 100, 100)
     draw_text_2d(x + 10, curr_y, f"{status_char} Historical (7d)", font_small, status_color)
-    curr_y -= line_height + 10
+    curr_y -= line_height + 6
     
     # Divider line
+    if curr_y < min_y: return
     glColor4f(0.3, 0.4, 0.6, 0.5)
     glBegin(GL_LINES)
-    glVertex2f(x + 10, curr_y + 5)
-    glVertex2f(x + panel_width - 10, curr_y + 5)
+    glVertex2f(x + 10, curr_y + 3)
+    glVertex2f(x + panel_width - 10, curr_y + 3)
     glEnd()
-    curr_y -= 5
     
     # COMPUTED VALUES section
-    draw_text_2d(x + 10, curr_y, "COMPUTED VALUES", font_small, (180, 180, 200))
-    curr_y -= line_height + 2
+    draw_text_2d(x + 10, curr_y, "COMPUTED", font_small, (180, 180, 200))
+    curr_y -= line_height
     
     # Anticipation
     anticipation = idle_trends.get('activity_anticipation', 0.5)
@@ -1716,22 +2456,21 @@ def draw_realtime_trends(idle_trends: dict, x: int, y: int, font, font_small, ag
     energy_color = (255, 200, 100) if energy > 0.6 else (150, 200, 150) if energy > 0.3 else (100, 100, 150)
     draw_text_2d(x + 10, curr_y, "Energy:", font_small, (180, 180, 180))
     draw_text_2d(x + 65, curr_y, f"[{energy_bar}]", font_small, energy_color)
-    curr_y -= line_height + 10
+    curr_y -= line_height + 6
     
     # ======================
     # AGGRESSION SECTION
     # ======================
-    if aggression:
+    if aggression and curr_y > min_y:
         # Divider line
         glColor4f(0.3, 0.4, 0.6, 0.5)
         glBegin(GL_LINES)
-        glVertex2f(x + 10, curr_y + 5)
-        glVertex2f(x + panel_width - 10, curr_y + 5)
+        glVertex2f(x + 10, curr_y + 3)
+        glVertex2f(x + panel_width - 10, curr_y + 3)
         glEnd()
-        curr_y -= 5
         
         draw_text_2d(x + 10, curr_y, "AGGRESSION", font_small, (255, 150, 100))
-        curr_y -= line_height + 2
+        curr_y -= line_height
         
         # Aggression level bar
         level = aggression.get('level', 0)
@@ -1782,22 +2521,21 @@ def draw_realtime_trends(idle_trends: dict, x: int, y: int, font, font_small, ag
         # Current engagement indicator
         if aggression.get('current_engagement'):
             draw_text_2d(x + 160, curr_y, "ENGAGED", font_small, (100, 255, 100))
-        curr_y -= line_height + 10
+        curr_y -= line_height + 6
     
     # ======================
     # FLOW POSITIONING SECTION (Phase 2B)
     # ======================
-    if flow:
+    if flow and curr_y > min_y:
         # Divider line
         glColor4f(0.3, 0.4, 0.6, 0.5)
         glBegin(GL_LINES)
-        glVertex2f(x + 10, curr_y + 5)
-        glVertex2f(x + panel_width - 10, curr_y + 5)
+        glVertex2f(x + 10, curr_y + 3)
+        glVertex2f(x + panel_width - 10, curr_y + 3)
         glEnd()
-        curr_y -= 5
         
-        draw_text_2d(x + 10, curr_y, "FLOW POSITIONING", font_small, (100, 200, 255))
-        curr_y -= line_height + 2
+        draw_text_2d(x + 10, curr_y, "FLOW", font_small, (100, 200, 255))
+        curr_y -= line_height
         
         # Flow direction visualization with arrows
         direction = flow.get('direction', 0)
@@ -1844,22 +2582,21 @@ def draw_realtime_trends(idle_trends: dict, x: int, y: int, font, font_small, ag
         rtl = flow.get('right_to_left', 0)
         total = flow.get('total_events', 0)
         draw_text_2d(x + 10, curr_y, f"30s: L→R:{ltr} R→L:{rtl} ({total})", font_small, (120, 120, 150))
-        curr_y -= line_height + 10
+        curr_y -= line_height + 6
     
     # ======================
     # ALMOST-ENGAGED SECTION (Phase 2C)
     # ======================
-    if almost_engaged:
+    if almost_engaged and curr_y > min_y:
         # Divider line
         glColor4f(0.3, 0.4, 0.6, 0.5)
         glBegin(GL_LINES)
-        glVertex2f(x + 10, curr_y + 5)
-        glVertex2f(x + panel_width - 10, curr_y + 5)
+        glVertex2f(x + 10, curr_y + 3)
+        glVertex2f(x + panel_width - 10, curr_y + 3)
         glEnd()
-        curr_y -= 5
         
         draw_text_2d(x + 10, curr_y, "ALMOST-ENGAGED", font_small, (255, 200, 100))
-        curr_y -= line_height + 2
+        curr_y -= line_height
         
         # Conversion stats
         total_det = almost_engaged.get('total_detected', 0)
@@ -1905,37 +2642,35 @@ def draw_realtime_trends(idle_trends: dict, x: int, y: int, font, font_small, ag
             
             draw_text_2d(x + 10, curr_y, f"#{pid}: {speed:.0f}cm/s d={dist:.0f}cm t={dur:.1f}s", font_small, c_color)
             curr_y -= line_height
+            if curr_y < min_y: return
 
     # ======================
     # FEEDBACK LEARNING SECTION (Phase 3)
     # ======================
-    if feedback_learning:
+    if feedback_learning and curr_y > min_y:
         # Divider line
         glColor4f(0.4, 0.3, 0.6, 0.5)
         glBegin(GL_LINES)
-        glVertex2f(x + 10, curr_y + 5)
-        glVertex2f(x + panel_width - 10, curr_y + 5)
+        glVertex2f(x + 10, curr_y + 3)
+        glVertex2f(x + panel_width - 10, curr_y + 3)
         glEnd()
-        curr_y -= 5
         
-        draw_text_2d(x + 10, curr_y, "FEEDBACK LEARNING", font_small, (200, 150, 255))
-        curr_y -= line_height + 2
+        draw_text_2d(x + 10, curr_y, "LEARNING", font_small, (200, 150, 255))
+        curr_y -= line_height
         
         # Total engagements
         total_eng = feedback_learning.get('total_engagements', 0)
         session_eng = feedback_learning.get('session_engagements', 0)
-        lr = feedback_learning.get('learning_rate', 0.02)
         
-        draw_text_2d(x + 10, curr_y, f"Engagements: {total_eng}", font_small, (180, 180, 180))
-        draw_text_2d(x + 130, curr_y, f"(session: {session_eng})", font_small, (150, 150, 150))
-        curr_y -= line_height
-        
-        # Top weighted behaviors
-        top_weights = feedback_learning.get('top_weights', {})
-        if top_weights:
-            draw_text_2d(x + 10, curr_y, "Top weights:", font_small, (150, 200, 150))
+        if curr_y > min_y:
+            draw_text_2d(x + 10, curr_y, f"Eng: {total_eng} (sess: {session_eng})", font_small, (180, 180, 180))
             curr_y -= line_height
-            for name, weight in list(top_weights.items())[:3]:
+        
+        # Top weighted behaviors (compact - only show 2)
+        top_weights = feedback_learning.get('top_weights', {})
+        if top_weights and curr_y > min_y:
+            for name, weight in list(top_weights.items())[:2]:
+                if curr_y < min_y: break
                 # Color based on weight (> 1.0 = good, green tint)
                 if weight > 1.1:
                     w_color = (100, 255, 150)
@@ -1943,7 +2678,7 @@ def draw_realtime_trends(idle_trends: dict, x: int, y: int, font, font_small, ag
                     w_color = (180, 255, 180)
                 else:
                     w_color = (180, 180, 180)
-                draw_text_2d(x + 20, curr_y, f"{name}: {weight:.2f}", font_small, w_color)
+                draw_text_2d(x + 10, curr_y, f"{name}: {weight:.2f}", font_small, w_color)
                 curr_y -= line_height - 2
 
 
@@ -2498,7 +3233,7 @@ class Checkbox:
 
 class Slider:
     """Simple horizontal slider for GUI"""
-    def __init__(self, x, y, width, height, min_val, max_val, value, label, format_str="{:.1f}"):
+    def __init__(self, x, y, width, height, min_val, max_val, value, label, format_str="{:.1f}", autotuned=False):
         self.rect = pygame.Rect(x, y, width, height)
         self.min_val = min_val
         self.max_val = max_val
@@ -2506,12 +3241,18 @@ class Slider:
         self.label = label
         self.format_str = format_str
         self.dragging = False
+        self.autotuned = autotuned  # If True, slider shows auto-tuned visual style
+        # Store original Y offset from display height for repositioning
+        self._y_offset = None
     
     def handle_event(self, event, screen_height):
         """Handle mouse events. Returns True if value changed."""
         if event.type == MOUSEBUTTONDOWN and event.button == 1:
             mouse_y = screen_height - event.pos[1]
-            if self.rect.collidepoint(event.pos[0], mouse_y):
+            # Expand click area: include label above (+22px) and padding below (-5px)
+            # Total clickable height = height + 27px (much easier to hit)
+            expanded = pygame.Rect(self.rect.x, self.rect.y - 5, self.rect.width, self.rect.height + 27)
+            if expanded.collidepoint(event.pos[0], mouse_y):
                 self.dragging = True
                 self._update_value(event.pos[0])
                 return True
@@ -2531,8 +3272,11 @@ class Slider:
         """Draw the slider using OpenGL"""
         x, y, w, h = self.rect.x, self.rect.y, self.rect.width, self.rect.height
         
-        # Background
-        glColor4f(0.2, 0.2, 0.25, 1.0)
+        # Background - slightly different for autotuned
+        if self.autotuned:
+            glColor4f(0.15, 0.15, 0.22, 1.0)
+        else:
+            glColor4f(0.2, 0.2, 0.25, 1.0)
         glBegin(GL_QUADS)
         glVertex2f(x, y)
         glVertex2f(x + w, y)
@@ -2540,10 +3284,13 @@ class Slider:
         glVertex2f(x, y + h)
         glEnd()
         
-        # Fill based on value
+        # Fill based on value - auto-tuned uses a distinct color
         ratio = (self.value - self.min_val) / (self.max_val - self.min_val)
         fill_w = w * ratio
-        glColor4f(0.3, 0.6, 0.8, 1.0)
+        if self.autotuned:
+            glColor4f(0.25, 0.45, 0.55, 0.8)  # Muted teal for auto-tuned
+        else:
+            glColor4f(0.3, 0.6, 0.8, 1.0)     # Bright blue for manual
         glBegin(GL_QUADS)
         glVertex2f(x, y)
         glVertex2f(x + fill_w, y)
@@ -2551,8 +3298,35 @@ class Slider:
         glVertex2f(x, y + h)
         glEnd()
         
-        # Border
-        glColor4f(0.5, 0.5, 0.5, 1.0)
+        # Thumb indicator (only for manual sliders)
+        if not self.autotuned:
+            thumb_x = x + fill_w
+            glColor4f(0.9, 0.9, 0.9, 1.0)
+            glBegin(GL_QUADS)
+            glVertex2f(thumb_x - 2, y - 2)
+            glVertex2f(thumb_x + 2, y - 2)
+            glVertex2f(thumb_x + 2, y + h + 2)
+            glVertex2f(thumb_x - 2, y + h + 2)
+            glEnd()
+        
+        # Highlight when dragging
+        if self.dragging:
+            glColor4f(0.4, 0.8, 1.0, 0.3)
+            glBegin(GL_QUADS)
+            glVertex2f(x, y)
+            glVertex2f(x + w, y)
+            glVertex2f(x + w, y + h)
+            glVertex2f(x, y + h)
+            glEnd()
+        
+        # Border - auto-tuned gets dashed-look subtle border
+        if self.dragging:
+            border_color = (0.6, 0.8, 1.0, 1.0)
+        elif self.autotuned:
+            border_color = (0.35, 0.45, 0.55, 0.6)
+        else:
+            border_color = (0.5, 0.5, 0.5, 1.0)
+        glColor4f(*border_color)
         glLineWidth(1)
         glBegin(GL_LINE_LOOP)
         glVertex2f(x, y)
@@ -2563,7 +3337,29 @@ class Slider:
         
         # Label and value
         val_str = self.format_str.format(self.value)
-        draw_text_2d(x, y + h + 5, f"{self.label}: {val_str}", font)
+        if self.autotuned:
+            draw_text_2d(x, y + h + 5, f"{self.label}: {val_str}", font, (160, 180, 190))
+        else:
+            draw_text_2d(x, y + h + 5, f"{self.label}: {val_str}", font)
+
+
+# =============================================================================
+# GUI SECTION HEADERS
+# =============================================================================
+
+def draw_section_header(x, y, width, title, font, color=(150, 150, 200), icon=""):
+    """Draw a section header with a horizontal line and title"""
+    label = f"{icon} {title}" if icon else title
+    # Draw header text
+    draw_text_2d(x, y, label, font, color)
+    # Draw subtle line under title
+    line_y = y - 4
+    glColor4f(color[0]/255*0.5, color[1]/255*0.5, color[2]/255*0.5, 0.4)
+    glLineWidth(1)
+    glBegin(GL_LINES)
+    glVertex2f(x, line_y)
+    glVertex2f(x + width, line_y)
+    glEnd()
 
 
 # =============================================================================
@@ -2591,9 +3387,15 @@ def main():
     pygame.init()
     pygame.font.init()
     
-    display = (1920, 1080)
-    screen = pygame.display.set_mode(display, DOUBLEBUF | OPENGL)
-    pygame.display.set_caption("3D Light Controller V2 - Production")
+    # Get display info for fullscreen
+    display_info = pygame.display.Info()
+    fullscreen_size = (display_info.current_w, display_info.current_h)
+    windowed_size = (1920, 1080)  # Fallback windowed size
+    is_fullscreen = True
+    display = fullscreen_size
+    # Use NOFRAME instead of FULLSCREEN - stays visible when focus is lost
+    screen = pygame.display.set_mode(display, DOUBLEBUF | OPENGL | NOFRAME)
+    pygame.display.set_caption("3D Light Controller V3 - Production")
     
     font = pygame.font.SysFont('monospace', 14)
     font_small = pygame.font.SysFont('monospace', 12)
@@ -2614,19 +3416,20 @@ def main():
     # Camera view framebuffers (initialized later when needed)
     camera_fbos = {}
     
-    # Camera
-    cam_rot_x = 20
-    cam_rot_y = -30
-    cam_distance = 500
-    cam_target = np.array([-160.0, 50.0, 50.0])  # Center on panels, look at tracking area
+    # Camera - positioned beyond passive zone (high Z), looking back at panels (low Z)
+    # Panels are near Z=0, passive zone ends at Z=553
+    cam_rot_x = 25          # Looking down at the scene
+    cam_rot_y = 0           # Looking toward panels (opposite of 180)
+    cam_distance = 900      # Even farther back
+    cam_target = np.array([-150.0, 0.0, 150.0])  # Target near panels
     cam_target_default = cam_target.copy()  # For reset
     cam_rot_x_default = cam_rot_x
     cam_rot_y_default = cam_rot_y
     cam_distance_default = cam_distance
     middle_mouse_down = False  # For panning
     
-    # GUI panel width
-    gui_width = 280
+    # GUI panel width (two-column layout)
+    gui_width = 560
     view_width = display[0] - gui_width
     
     # Create systems
@@ -2653,6 +3456,15 @@ def main():
     # Tracking database
     tracking_db = TrackingDatabase(current_db_file)
     print(f"💾 Tracking database: {current_db_file}")
+    
+    # Restore daily_count from database so it persists across restarts
+    try:
+        startup_stats = tracking_db.get_current_stats()
+        restored_count = startup_stats.get('daily_unique_people', 0)
+        tracked_manager.daily_count = restored_count
+        print(f"📊 Restored daily count from DB: {restored_count} unique people today")
+    except Exception as e:
+        print(f"⚠️ Could not restore daily count from DB: {e}")
     
     # Behavior system with default personality
     meta_params = MetaParameters()
@@ -2710,52 +3522,140 @@ def main():
     
     # Track current report for visualization
     current_daily_report: Optional[DailyReport] = None
+    cached_report_dict: Optional[dict] = None  # Cached serialized report
+    report_version = 0  # Increment when report changes
+    last_sent_report_version = -1  # Track what version client has
     show_trends = True  # Toggle with 'T' key - ON by default
+    population_day = datetime.now().date()
     
     def on_report_ready(report: DailyReport):
-        nonlocal current_daily_report
+        nonlocal current_daily_report, cached_report_dict, report_version
         current_daily_report = report
+        cached_report_dict = report.to_dict() if report else None
+        report_version += 1
+        
+        # Save auto-tune learnings to database and apply them
+        try:
+            if report.auto_tuning_analysis:
+                learnings = auto_tuner.compute_daily_learnings(report)
+                
+                # Save to database
+                report_data = {
+                    'total_unique_people': report.total_unique_people,
+                    'peak_hour': report.peak_hour,
+                }
+                tracking_db.save_autotune_learnings(
+                    date_str=report.date,
+                    report_data=report_data,
+                    tuning_analysis=report.auto_tuning_analysis,
+                    optimal_values=learnings.get('optimal_values'),
+                    learned_caps=learnings.get('learned_caps'),
+                )
+                logger.info(f"🧠 Auto-tune learnings saved for {report.date}")
+                
+                # Apply learned caps immediately for tomorrow
+                learned_caps = learnings.get('learned_caps', {})
+                if learned_caps:
+                    auto_tuner.learned_caps_adjustments = learned_caps
+                    for name, cap_val in learned_caps.items():
+                        if name in auto_tuner.caps:
+                            auto_tuner.caps[name] = cap_val
+                    logger.info(f"🧠 Applied {len(learned_caps)} learned cap adjustments")
+        except Exception as e:
+            logger.warning(f"Failed to save/apply auto-tune learnings: {e}")
     
     daily_report_scheduler.on_report_ready = on_report_ready
     
-    # Create sliders
-    slider_x = view_width + 20
-    slider_w = gui_width - 40
-    slider_h = 12
+    # Create sliders - Two column layout
+    # Left column: Manual controls (calibration + budget + mode status)
+    # Right column: Auto-tuned parameters (personality + output multipliers + auto-tune status)
+    col_padding = 20
+    col_gap = 20
+    col_width = (gui_width - col_padding * 2 - col_gap) // 2  # ~250px each
+    left_col_x = view_width + col_padding
+    right_col_x = view_width + col_padding + col_width + col_gap
+    slider_x = left_col_x  # Keep for backward compat
+    slider_w = col_width
+    slider_h = 16
     
-    # Calibration sliders (top section - below title)
+    # Y-offset definitions (from top of screen)
+    # Left column: Calibration (Manual) + Manual Controls
+    # Right column: Personality (Auto-tuned) + Output Multipliers (Auto-tuned)
+    # Note: section header ~70, sub-label ~90, first slider needs to clear label text
+    slider_y_offsets = {
+        # ── LEFT COLUMN: Calibration (Manual) ──
+        'offset_x': 120, 'offset_z': 160,
+        'scale_x': 205, 'scale_z': 245,
+        # Checkbox
+        'invert_x_cb': 280,
+        # ── LEFT COLUMN: Manual Controls ──
+        'interaction_budget': 420,
+        # ── RIGHT COLUMN: Personality (Auto-tuned) ──
+        'responsiveness': 120, 'energy': 160, 'attention_span': 200,
+        'sociability': 240, 'exploration': 280, 'memory': 320,
+        # ── RIGHT COLUMN: Output Multipliers (Auto-tuned) ──
+        'brightness_global': 385, 'speed_global': 425, 'pulse_global': 465,
+        'follow_speed_global': 505, 'dwell_influence': 545, 'idle_trend_weight': 585,
+    }
+    
+    # Track which sliders go in which column
+    left_col_sliders = {'offset_x', 'offset_z', 'scale_x', 'scale_z', 'interaction_budget'}
+    right_col_sliders = {'responsiveness', 'energy', 'attention_span', 'sociability',
+                         'exploration', 'memory', 'brightness_global', 'speed_global',
+                         'pulse_global', 'follow_speed_global', 'dwell_influence', 'idle_trend_weight'}
+    
+    def reposition_sliders():
+        """Reposition all sliders/checkboxes based on current display size"""
+        nonlocal left_col_x, right_col_x, col_width, slider_x, slider_w
+        left_col_x = view_width + col_padding
+        right_col_x = view_width + col_padding + col_width + col_gap
+        slider_x = left_col_x
+        slider_w = col_width
+        for name, slider in all_sliders.items():
+            y_off = slider_y_offsets[name]
+            if name in right_col_sliders:
+                slider.rect.x = right_col_x
+            else:
+                slider.rect.x = left_col_x
+            slider.rect.y = display[1] - y_off
+            slider.rect.width = col_width
+        for name, checkbox in checkboxes.items():
+            cb_off = slider_y_offsets.get(f'{name}_cb', 260)
+            checkbox.rect.x = left_col_x
+            checkbox.rect.y = display[1] - cb_off
+    
+    # Calibration sliders (LEFT column - manual, user adjustable)
     sliders = {
-        # Offset sliders
-        'offset_x': Slider(slider_x, display[1] - 100, slider_w, slider_h, -200, 200, 0, "Offset X"),
-        'offset_z': Slider(slider_x, display[1] - 140, slider_w, slider_h, 0, 500, 250, "Offset Z"),
-        # Scale sliders
-        'scale_x': Slider(slider_x, display[1] - 190, slider_w, slider_h, 0.5, 2.0, 1.0, "Scale X", "{:.2f}"),
-        'scale_z': Slider(slider_x, display[1] - 230, slider_w, slider_h, 0.5, 2.0, 1.0, "Scale Z", "{:.2f}"),
+        'offset_x': Slider(left_col_x, display[1] - 120, col_width, slider_h, -200, 200, 0, "Offset X"),
+        'offset_z': Slider(left_col_x, display[1] - 160, col_width, slider_h, 0, 500, 250, "Offset Z"),
+        'scale_x': Slider(left_col_x, display[1] - 205, col_width, slider_h, 0.5, 2.0, 1.0, "Scale X", "{:.2f}"),
+        'scale_z': Slider(left_col_x, display[1] - 245, col_width, slider_h, 0.5, 2.0, 1.0, "Scale Z", "{:.2f}"),
     }
     
-    # Calibration checkboxes
+    # Calibration checkboxes (LEFT column)
     checkboxes = {
-        'invert_x': Checkbox(slider_x, display[1] - 265, 14, "Invert X Direction", checked=False),
+        'invert_x': Checkbox(left_col_x, display[1] - 280, 14, "Invert X Direction", checked=False),
     }
     
-    # Personality sliders (middle section - starts after checkbox)
+    # Personality sliders (RIGHT column - auto-tuned by behavior system)
     personality_sliders = {
-        'responsiveness': Slider(slider_x, display[1] - 330, slider_w, slider_h, 0, 1, 0.5, "Responsiveness", "{:.2f}"),
-        'energy': Slider(slider_x, display[1] - 370, slider_w, slider_h, 0, 1, 0.5, "Energy", "{:.2f}"),
-        'attention_span': Slider(slider_x, display[1] - 410, slider_w, slider_h, 0, 1, 0.5, "Attention", "{:.2f}"),
-        'sociability': Slider(slider_x, display[1] - 450, slider_w, slider_h, 0, 1, 0.5, "Sociability", "{:.2f}"),
-        'exploration': Slider(slider_x, display[1] - 490, slider_w, slider_h, 0, 1, 0.5, "Exploration", "{:.2f}"),
-        'memory': Slider(slider_x, display[1] - 530, slider_w, slider_h, 0, 1, 0.5, "Memory", "{:.2f}"),
+        'responsiveness': Slider(right_col_x, display[1] - 120, col_width, slider_h, 0, 1, 0.5, "Responsiveness", "{:.2f}", autotuned=True),
+        'energy': Slider(right_col_x, display[1] - 160, col_width, slider_h, 0, 1, 0.5, "Energy", "{:.2f}", autotuned=True),
+        'attention_span': Slider(right_col_x, display[1] - 200, col_width, slider_h, 0, 1, 0.5, "Attention", "{:.2f}", autotuned=True),
+        'sociability': Slider(right_col_x, display[1] - 240, col_width, slider_h, 0, 1, 0.5, "Sociability", "{:.2f}", autotuned=True),
+        'exploration': Slider(right_col_x, display[1] - 280, col_width, slider_h, 0, 1, 0.5, "Exploration", "{:.2f}", autotuned=True),
+        'memory': Slider(right_col_x, display[1] - 320, col_width, slider_h, 0, 1, 0.5, "Memory", "{:.2f}", autotuned=True),
     }
     
-    # Global multiplier sliders (lower section)
+    # Global multiplier sliders (RIGHT column - auto-tuned) + interaction_budget (LEFT column - manual)
     global_sliders = {
-        'brightness_global': Slider(slider_x, display[1] - 600, slider_w, slider_h, 0.2, 2.0, 1.0, "Brightness ×", "{:.2f}"),
-        'speed_global': Slider(slider_x, display[1] - 640, slider_w, slider_h, 0.2, 2.0, 1.0, "Speed ×", "{:.2f}"),
-        'pulse_global': Slider(slider_x, display[1] - 680, slider_w, slider_h, 0.3, 3.0, 1.0, "Pulse ×", "{:.2f}"),
-        'follow_speed_global': Slider(slider_x, display[1] - 720, slider_w, slider_h, 0.5, 3.0, 1.0, "Follow Speed ×", "{:.2f}"),
-        'dwell_influence': Slider(slider_x, display[1] - 760, slider_w, slider_h, 0.0, 2.0, 1.0, "Dwell Influence", "{:.2f}"),
-        'idle_trend_weight': Slider(slider_x, display[1] - 800, slider_w, slider_h, 0.0, 2.0, 1.0, "Idle Trend ×", "{:.2f}"),
+        'brightness_global': Slider(right_col_x, display[1] - 385, col_width, slider_h, 0.2, 5.0, 1.0, "Brightness ×", "{:.2f}", autotuned=True),
+        'speed_global': Slider(right_col_x, display[1] - 425, col_width, slider_h, 0.2, 2.0, 1.0, "Speed ×", "{:.2f}", autotuned=True),
+        'pulse_global': Slider(right_col_x, display[1] - 465, col_width, slider_h, 0.3, 3.0, 1.0, "Pulse ×", "{:.2f}", autotuned=True),
+        'follow_speed_global': Slider(right_col_x, display[1] - 505, col_width, slider_h, 0.5, 3.0, 1.0, "Follow Spd ×", "{:.2f}", autotuned=True),
+        'dwell_influence': Slider(right_col_x, display[1] - 545, col_width, slider_h, 0.0, 2.0, 1.0, "Dwell Influence", "{:.2f}", autotuned=True),
+        'idle_trend_weight': Slider(right_col_x, display[1] - 585, col_width, slider_h, 0.0, 2.0, 1.0, "Idle Trend ×", "{:.2f}", autotuned=True),
+        'interaction_budget': Slider(left_col_x, display[1] - 420, col_width, slider_h, 0.0, 120.0, 60.0, "Interaction Budget", "{:.0f}", autotuned=False),
     }
     
     # Combine all sliders
@@ -2775,8 +3675,16 @@ def main():
         for name, slider in personality_sliders.items():
             setattr(meta_params, name, slider.value)
         for name, slider in global_sliders.items():
-            setattr(meta_params, name, slider.value)
+            if name != 'interaction_budget':
+                setattr(meta_params, name, slider.value)
         print(f"📁 Restored {len(saved_settings)} slider settings")
+
+    # Auto-tuning manager (trend responsive adjustments)
+    auto_tuner = AutoTuningManager(meta=meta_params, sliders=all_sliders, database=tracking_db)
+    
+    # Load and apply historical learnings from previous days' reports
+    auto_tuner.load_learnings_from_db()
+    auto_tuner.apply_learnings_to_values()
     
     # Track when to save sliders (debounce saves)
     last_slider_save = time.time()
@@ -2807,20 +3715,24 @@ def main():
     start_time = time.time()
     last_health_log = time.time()
     last_db_prune = time.time()
+    last_hour_aggregated = datetime.now().hour  # Track hourly aggregation
     frame_count = 0
     total_osc_messages = 0
     
-    logger.info("Light controller V2 started - entering main loop")
+    logger.info("Light controller V3 started - entering main loop")
     print("\n" + "="*60)
-    print("V2 DEVELOPMENT VERSION - Visual Debugging Enabled")
+    print("V3 DEVELOPMENT VERSION - Visual Debugging Enabled")
     print("="*60)
     print("Controls:")
     print("  L = Toggle coordinate labels")
     print("  M = Toggle AR markers")
     print("  SPACE = Toggle wandering")
+    print("  A = Toggle auto-tuning")
     print("  P = Cycle presets")
     print("  T = Toggle trends visualization")
+    print("  F = Toggle fullscreen/windowed")
     print("  R = Generate daily report (manual)")
+    print("  F2 = Take screenshot")
     print("  Q/ESC = Quit")
     print("="*60)
     print("📅 Daily report auto-generates at 12:01 AM")
@@ -2849,7 +3761,23 @@ def main():
                         setattr(meta_params, name, slider.value)
                     # Update global multipliers
                     elif name in global_sliders:
-                        setattr(meta_params, name, slider.value)
+                        if name != 'interaction_budget':
+                            setattr(meta_params, name, slider.value)
+            
+            # Debug: log click position when clicking in GUI area
+            if event.type == MOUSEBUTTONDOWN and event.button == 1 and event.pos[0] >= view_width:
+                mouse_y_gl = display[1] - event.pos[1]
+                hit_any = False
+                for sname, s in all_sliders.items():
+                    expanded = pygame.Rect(s.rect.x, s.rect.y - 5, s.rect.width, s.rect.height + 25)
+                    if expanded.collidepoint(event.pos[0], mouse_y_gl):
+                        hit_any = True
+                        break
+                if not hit_any:
+                    print(f"🎯 Click in GUI at pygame=({event.pos[0]}, {event.pos[1]}) gl_y={mouse_y_gl} - no slider hit")
+                    # Find nearest slider
+                    nearest = min(all_sliders.items(), key=lambda kv: abs(kv[1].rect.y - mouse_y_gl))
+                    print(f"   Nearest slider: {nearest[0]} at gl_y={nearest[1].rect.y} (dist={abs(nearest[1].rect.y - mouse_y_gl)})")
             
             # Check checkboxes
             for name, checkbox in checkboxes.items():
@@ -2867,6 +3795,9 @@ def main():
                     running = False
                 elif event.key == K_SPACE:
                     wander.enabled = not wander.enabled
+                elif event.key == K_a:
+                    auto_tuner.set_enabled(not auto_tuner.enabled)
+                    print(f"Auto-tuning {'enabled' if auto_tuner.enabled else 'disabled'}")
                 elif event.key == K_m:
                     show_markers = not show_markers
                     print(f"Markers {'visible' if show_markers else 'hidden'}")
@@ -2892,6 +3823,29 @@ def main():
                 elif event.key == K_t:
                     show_trends = not show_trends
                     print(f"Trends visualization {'visible' if show_trends else 'hidden'}")
+                elif event.key == K_f:
+                    # Toggle fullscreen mode
+                    is_fullscreen = not is_fullscreen
+                    pygame.display.quit()
+                    pygame.display.init()
+                    if is_fullscreen:
+                        display = fullscreen_size
+                        # Use NOFRAME instead of FULLSCREEN - stays visible when focus is lost
+                        screen = pygame.display.set_mode(display, DOUBLEBUF | OPENGL | NOFRAME)
+                    else:
+                        display = windowed_size
+                        screen = pygame.display.set_mode(display, DOUBLEBUF | OPENGL | RESIZABLE)
+                    pygame.display.set_caption("3D Light Controller V3 - Production")
+                    # Reinitialize OpenGL state after display change
+                    glEnable(GL_DEPTH_TEST)
+                    glEnable(GL_BLEND)
+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+                    glClearColor(0.1, 0.1, 0.15, 1.0)
+                    glViewport(0, 0, display[0], display[1])
+                    # Update layout for new display size
+                    view_width = display[0] - gui_width
+                    reposition_sliders()
+                    print(f"{'Fullscreen' if is_fullscreen else 'Windowed'} mode ({display[0]}x{display[1]})")
                 elif event.key == K_HOME:
                     # Reset camera to default view
                     cam_rot_x = cam_rot_x_default
@@ -2919,11 +3873,31 @@ def main():
                         osc_handler.database = tracking_db
                         report_generator.database = tracking_db
                         current_db_file = new_db_file
+                        # Restore daily count from new database
+                        try:
+                            switch_stats = tracking_db.get_current_stats()
+                            tracked_manager.daily_count = switch_stats.get('daily_unique_people', 0)
+                        except Exception:
+                            pass
                         # Clear cached report
                         current_daily_report = None
                         print(f"💾 Switched to database: {new_db_file}")
                     else:
                         print(f"💾 Only one database available: {current_db_file}")
+                elif event.key == K_F2:
+                    # Screenshot - save window capture to repo
+                    try:
+                        screenshot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'screenshots')
+                        os.makedirs(screenshot_dir, exist_ok=True)
+                        timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+                        screenshot_path = os.path.join(screenshot_dir, f'screenshot_{timestamp_str}.png')
+                        screenshot_surface = pygame.Surface(display)
+                        pixel_data = glReadPixels(0, 0, display[0], display[1], GL_RGB, GL_UNSIGNED_BYTE)
+                        screenshot_surface = pygame.image.fromstring(pixel_data, display, 'RGB', True)
+                        pygame.image.save(screenshot_surface, screenshot_path)
+                        print(f"📸 Screenshot saved: {screenshot_path}")
+                    except Exception as e:
+                        print(f"⚠️ Screenshot failed: {e}")
             
             # Camera rotation (only in 3D view area)
             if event.type == MOUSEBUTTONDOWN and event.button == 1:
@@ -3005,6 +3979,11 @@ def main():
         now = time.time()
         dt = min(now - last_time, 0.1)
         last_time = now
+        now_dt = datetime.now()
+
+        if now_dt.date() != population_day and (now_dt.hour > 0 or now_dt.minute >= 1):
+            tracked_manager.reset_daily_population()
+            population_day = now_dt.date()
         
         # Cleanup stale tracked people
         tracked_manager.cleanup_stale()
@@ -3032,6 +4011,9 @@ def main():
             passive_rate=passive_rate,
             flow_balance=flow_balance
         )
+
+        behavior_status = behavior.get_status()
+        auto_tuner.update(behavior_status, now)
         
         # Update light position for feedback learning context
         behavior.set_light_position(*current_pos)
@@ -3069,8 +4051,43 @@ def main():
                                 time.time() - ws_broadcaster.last_broadcast >= WEBSOCKET_BROADCAST_INTERVAL):
             try:
                 # Build behavior status text
-                behavior_status = behavior.get_status()
                 status_text = behavior_status.get('status_text', '')
+                
+                # Extract realtime trends for public viewer
+                idle_trends = behavior_status.get('idle_trends', {})
+                realtime_trends = None
+                if idle_trends:
+                    realtime_trends = {
+                        'period': idle_trends.get('period', 'unknown'),
+                        'seconds_since_update': idle_trends.get('seconds_since_update', 0),
+                        # 1 minute window
+                        'recent': {
+                            'available': idle_trends.get('has_recent', False),
+                            'passive': idle_trends.get('recent_passive', 0),
+                            'active': idle_trends.get('recent_active', 0),
+                        },
+                        # 5 minute window
+                        'short': {
+                            'available': idle_trends.get('has_short', False),
+                            'passive': idle_trends.get('short_passive', 0),
+                            'active': idle_trends.get('short_active', 0),
+                            'activity': idle_trends.get('short_activity', 0),
+                        },
+                        # 15 minute window  
+                        'medium': {
+                            'available': idle_trends.get('has_medium', False),
+                            'passive': idle_trends.get('medium_passive', 0),
+                            'active': idle_trends.get('medium_active', 0),
+                            'activity': idle_trends.get('medium_activity', 0),
+                        },
+                        # 60 minute window
+                        'long': {
+                            'available': idle_trends.get('has_long', False),
+                            'passive': idle_trends.get('long_passive', 0),
+                            'active': idle_trends.get('long_active', 0),
+                            'activity': idle_trends.get('long_activity', 0),
+                        },
+                    }
                 
                 state = {
                     'type': 'state_update',
@@ -3081,9 +4098,27 @@ def main():
                         'brightness': float(light.get_brightness()),
                         'falloff_radius': float(light.falloff_radius)
                     },
+                    'wander_box': {
+                        'min_x': float(wander.wander_box['min_x']),
+                        'max_x': float(wander.wander_box['max_x']),
+                        'min_y': float(wander.wander_box['min_y']),
+                        'max_y': float(wander.wander_box['max_y']),
+                        'min_z': float(wander.wander_box['min_z']),
+                        'max_z': float(wander.wander_box['max_z']),
+                        'enabled': wander.enabled
+                    },
                     'panels': panel_system.get_dmx_values()[:12],
                     'people': [
-                        {'id': p.track_id, 'x': p.x, 'y': p.y, 'z': p.z, 'zone': p.zone}
+                        {
+                            'id': p.track_id,
+                            'daily_id': p.daily_id,
+                            'x': p.x,
+                            'y': p.y,
+                            'z': p.z,
+                            'vx': p.vx,
+                            'vz': p.vz,
+                            'zone': p.zone
+                        }
                         for p in tracked_manager.get_all()
                     ],
                     'counts': {
@@ -3091,11 +4126,30 @@ def main():
                         'passive': passive_count,
                         'total': len(tracked_manager.get_all())
                     },
+                    'population_count': tracked_manager.daily_count,
+                    'wander_box': wander.wander_box,  # Current wander box (can change dynamically)
                     'mode': behavior.state.mode.name if behavior else 'UNKNOWN',
                     'gesture': behavior.state.gesture.name if behavior and behavior.state.gesture else None,
                     'status': status_text,
+                    'realtime_trends': realtime_trends,
+                    'auto_tuning': {
+                        'enabled': auto_tuner.enabled,
+                        'revision': auto_tuner.revision,
+                        'last_adjustment': auto_tuner.last_adjustment,
+                        'params': {name: round(float(getattr(meta_params, name)), 3) for name in auto_tuner.param_order},
+                    },
+                    'population': {
+                        'current': len(tracked_manager.get_all()),
+                        'active': active_count,
+                        'passive': passive_count,
+                        'daily_total': tracked_manager.daily_count,
+                        'daily_unique_db': db_stats.get('daily_unique_people', 0),
+                    },
                     'daily_report_available': current_daily_report is not None,
                     'daily_report_date': current_daily_report.date if current_daily_report else None,
+                    'report_version': report_version,
+                    # Include cached report data (pre-serialized for efficiency)
+                    'daily_report': cached_report_dict,
                 }
                 ws_broadcaster.update_state(state)
                 ws_broadcaster.last_broadcast = time.time()
@@ -3205,6 +4259,13 @@ def main():
         # Draw panels
         for (unit, panel_num), panel in panel_system.panels.items():
             draw_panel(panel['center'], panel['angle'], PANEL_SIZE, panel['brightness'])
+            draw_text_3d_billboard(
+                panel['center'],
+                str(panel['dmx_value']),
+                font_small,
+                (255, 0, 255),
+                offset_y=10
+            )
         
         # Draw panel center indicators (wireframe spheres with labels)
         draw_panel_centers(panel_system, font_label, show_labels)
@@ -3285,14 +4346,26 @@ def main():
                     draw_camera_view_overlay(camera_fbos[cam_name], x_pos, y_pos, 
                                            cam_view_w, cam_view_h, cam_name, font_small, border_color)
         
-        # GUI title
-        draw_text_2d(view_width + 20, display[1] - 30, "LIGHT CONTROLLER V2 - DEV", font)
-        draw_text_2d(view_width + 20, display[1] - 50, "─" * 24, font)
+        # GUI title (centered across full panel)
+        title_center_x = view_width + gui_width // 2 - 100
+        draw_text_2d(title_center_x, display[1] - 30, "LIGHT CONTROLLER V3", font)
+        draw_text_2d(view_width + col_padding, display[1] - 50, "─" * 62, font)
         
-        # Section labels (adjusted for checkbox)
-        draw_text_2d(view_width + 20, display[1] - 70, "Calibration:", font_small, (150, 150, 200))
-        draw_text_2d(view_width + 20, display[1] - 300, "Personality:", font_small, (150, 200, 150))
-        draw_text_2d(view_width + 20, display[1] - 570, "Global Multipliers:", font_small, (200, 150, 150))
+        # Column headers
+        # Left column: Manual controls
+        draw_section_header(left_col_x, display[1] - 70, col_width, "MANUAL CONTROLS", font_small, (150, 180, 220), "🎛️")
+        # Right column: Auto-tuned
+        draw_section_header(right_col_x, display[1] - 70, col_width, "AUTO-TUNED", font_small, (120, 180, 170), "🤖")
+        
+        # Sub-section headers
+        # Left: Calibration label
+        draw_text_2d(left_col_x, display[1] - 100, "Calibration", font_small, (130, 140, 170))
+        # Left: Budget label  
+        draw_text_2d(left_col_x, display[1] - 350, "Tuning Budget", font_small, (130, 140, 170))
+        # Right: Personality label
+        draw_text_2d(right_col_x, display[1] - 100, "Personality", font_small, (100, 150, 140))
+        # Right: Output multipliers label
+        draw_text_2d(right_col_x, display[1] - 345, "Output Multipliers", font_small, (100, 150, 140))
         
         # Draw all sliders
         for slider in all_sliders.values():
@@ -3313,11 +4386,14 @@ def main():
             last_slider_save = time.time()
             sliders_dirty = False
         
-        # Behavior status section (at bottom of GUI)
+        # ─── BOTTOM SECTION: Mode Decision (left) + Auto-Tune (right) ───
+        bottom_section_top = display[1] - 640
+        draw_text_2d(view_width + col_padding, bottom_section_top + 14, "─" * 62, font_small, (80, 80, 100))
+        
+        # Behavior status section (LEFT side of bottom)
         behavior_status = behavior.get_status()
-        status_y = 200  # Start position from bottom
-        draw_text_2d(view_width + 20, status_y + 50, "─" * 20, font_small)
-        draw_text_2d(view_width + 20, status_y + 35, "MODE DECISION:", font_small, (255, 200, 100))
+        status_y = bottom_section_top - 10
+        draw_text_2d(left_col_x, status_y + 14, "MODE DECISION", font_small, (255, 200, 100))
         
         # Mode and preset
         mode_colors = {
@@ -3331,7 +4407,6 @@ def main():
         # Get driving factors
         factors = behavior_status.get('driving_factors', {})
         params = factors.get('current_params', {})
-        thresholds = factors.get('thresholds', {})
         
         # DECISION INPUTS - what's actually driving the mode
         active = factors.get('active_count', 0)
@@ -3348,15 +4423,12 @@ def main():
             active_indicator = " → CROWD"
         elif active >= 1:
             active_indicator = " → ENGAGED"
-        draw_text_2d(view_width + 20, status_y + 17, f"  Active: {active}{active_indicator}", font_small, active_color)
+        draw_text_2d(left_col_x, status_y - 4, f"  Active: {active}{active_indicator}", font_small, active_color)
         
         # Passive count and rate - drives FLOW mode
         passive_color = (200, 200, 100) if passive_rate >= flow_thresh else (150, 150, 150)
         flow_indicator = " → FLOW" if (passive_rate >= flow_thresh and active == 0 and flow_enabled) else ""
-        draw_text_2d(view_width + 20, status_y + 1, f"  Passive: {passive} ({passive_rate:.1f}/min){flow_indicator}", font_small, passive_color)
-        
-        # Thresholds reference
-        draw_text_2d(view_width + 20, status_y - 15, f"  Thresholds: CROWD≥2, ENG≥1, FLOW≥{flow_thresh}/m", font_small, (120, 120, 120))
+        draw_text_2d(left_col_x, status_y - 20, f"  Passive: {passive} ({passive_rate:.1f}/min){flow_indicator}", font_small, passive_color)
         
         # Mode with duration and stability
         mode_duration = factors.get('mode_duration', 0)
@@ -3366,100 +4438,72 @@ def main():
         
         # Current mode line
         stability_char = "●" if mode_stable else f"◐{stability_pct}%"
-        mode_text = f"  Current: {behavior_status['mode'].upper()} [{mode_duration:.1f}s] {stability_char}"
-        draw_text_2d(view_width + 20, status_y - 33, mode_text, font_small, mode_color)
+        mode_text = f"  {behavior_status['mode'].upper()} [{mode_duration:.1f}s] {stability_char}"
+        draw_text_2d(left_col_x, status_y - 50, mode_text, font_small, mode_color)
         
         # Pending mode if any
         pending = behavior_status.get('pending_mode')
         if pending:
             pending_color = mode_colors.get(pending['mode'], (200, 200, 200))
             pending_pct = int(pending['progress'] * 100)
-            pending_text = f"  Pending: {pending['mode'].upper()} ({pending_pct}% of {pending['time_required']:.0f}s)"
-            draw_text_2d(view_width + 20, status_y - 49, pending_text, font_small, pending_color)
-            y_next = status_y - 65
+            pending_text = f"  → {pending['mode'].upper()} ({pending_pct}%)"
+            draw_text_2d(left_col_x, status_y - 66, pending_text, font_small, pending_color)
+            y_next = status_y - 82
         else:
-            y_next = status_y - 49
+            y_next = status_y - 66
         
         # Current output parameters (condensed)
-        draw_text_2d(view_width + 20, y_next, f"  Output: B{params.get('brightness_min', 0):.0f}-{params.get('brightness_max', 0):.0f} P{params.get('pulse_speed', 0):.0f} R{params.get('falloff_radius', 0):.0f}", font_small, (150, 150, 150))
+        draw_text_2d(left_col_x, y_next, f"  B{params.get('brightness_min', 0):.0f}-{params.get('brightness_max', 0):.0f} P{params.get('pulse_speed', 0):.0f} R{params.get('falloff_radius', 0):.0f}", font_small, (150, 150, 150))
         y_next -= 14
-        
-        # Time of day influence
-        time_mood = factors.get('time_mood', 'active')
-        time_bright = factors.get('time_brightness', 1.0)
-        draw_text_2d(view_width + 20, y_next, f"  Time: {time_mood} (×{time_bright:.1f})", font_small, (150, 150, 180))
-        y_next -= 14
-        
-        # Dwell bonus if active
-        dwell_bonus = factors.get('dwell_bonus', 0)
-        if dwell_bonus > 0:
-            dwell_time = factors.get('dwell_time', 0)
-            draw_text_2d(view_width + 20, y_next, f"  Dwell: +{dwell_bonus:.0f} ({dwell_time:.0f}s)", font_small, (100, 255, 100))
-            y_next -= 14
-        
-        # Bloom if active
-        bloom_progress = factors.get('bloom_progress', 0)
-        if bloom_progress > 0:
-            draw_text_2d(view_width + 20, y_next, f"  BLOOM: {bloom_progress*100:.0f}%", font_small, (255, 200, 100))
-            y_next -= 14
-        
-        # Idle trends (when in IDLE mode)
-        idle_trends = behavior_status.get('idle_trends')
-        if idle_trends and behavior_status['mode'] == 'idle':
-            anticipation = idle_trends.get('activity_anticipation', 0.5)
-            momentum = idle_trends.get('flow_momentum', 0)
-            energy = idle_trends.get('energy_level', 0.5)
-            period = idle_trends.get('period', 'unknown')
-            
-            # Anticipation bar (how ready for action)
-            ant_bar = "█" * int(anticipation * 10) + "░" * (10 - int(anticipation * 10))
-            ant_color = (100, 255, 100) if anticipation > 0.6 else (150, 150, 150)
-            draw_text_2d(view_width + 20, y_next, f"  Anticipation: [{ant_bar}]", font_small, ant_color)
-            y_next -= 14
-            
-            # Flow momentum indicator (-1 to +1)
-            if abs(momentum) > 0.1:
-                flow_dir = "→" if momentum > 0 else "←"
-                flow_str = f"{flow_dir * int(abs(momentum) * 5)}"
-                flow_color = (100, 200, 255) if momentum > 0 else (255, 200, 100)
-                draw_text_2d(view_width + 20, y_next, f"  Flow: {flow_str} ({momentum:+.2f})", font_small, flow_color)
-                y_next -= 14
-            
-            # Energy level
-            energy_bar = "█" * int(energy * 10) + "░" * (10 - int(energy * 10))
-            draw_text_2d(view_width + 20, y_next, f"  Energy: [{energy_bar}] {period}", font_small, (180, 180, 255))
-            y_next -= 14
         
         # Preset and status text
-        draw_text_2d(view_width + 20, y_next, f"  Preset: {current_preset}", font_small)
+        draw_text_2d(left_col_x, y_next, f"  Preset: {current_preset}", font_small)
         y_next -= 14
         
         # Status text (for public display)
         if behavior_status['status_text']:
-            draw_text_2d(view_width + 20, y_next, f"  \"{behavior_status['status_text']}\"", font_small, (200, 200, 255))
+            draw_text_2d(left_col_x, y_next, f"  \"{behavior_status['status_text']}\"", font_small, (200, 200, 255))
 
-        # Controls help at bottom (three lines now with database info)
-        draw_text_2d(view_width + 20, 50, "SPC=wander M=markers L=labels P=preset Q=quit", font_small, (120, 120, 120))
-        draw_text_2d(view_width + 20, 35, "T=trends R=report D=database", font_small, (120, 120, 120))
+        # Auto-tuning panel (RIGHT side of bottom section - expanded to fill space)
+        auto_panel_width = col_width
+        auto_panel_x = right_col_x
+        auto_panel_top = bottom_section_top - 10
+        auto_panel_bottom = 80  # Leave room for help text at bottom
+        auto_panel_height = auto_panel_top - auto_panel_bottom
+        auto_panel_y = auto_panel_bottom
+        draw_auto_tuning_panel(
+            auto_panel_x,
+            auto_panel_y,
+            auto_panel_width,
+            auto_panel_height,
+            font,
+            font_small,
+            auto_tuner.enabled,
+            auto_tuner.last_adjustment,
+            auto_tuner.history,
+            auto_tuner.budget_current,
+            auto_tuner._budget_max(),
+        )
+
+        # Controls help at bottom
+        draw_text_2d(left_col_x, 50, "SPC=wander A=tune T=trends P=preset M=markers L=labels R=report D=db Q=quit", font_small, (120, 120, 120))
         # Current database indicator
         db_color = (100, 180, 255) if len(db_files) > 1 else (120, 120, 120)
-        draw_text_2d(view_width + 20, 20, f"DB: {current_db_file} ({current_db_index+1}/{len(db_files)})", font_small, db_color)
+        draw_text_2d(left_col_x, 20, f"DB: {current_db_file} ({current_db_index+1}/{len(db_files)})", font_small, db_color)
         
         # Legend in 3D view area (top left)
-        draw_text_2d(10, display[1] - 20, "V2 VISUAL DEBUG:", font_small, (255, 200, 100))
-        draw_text_2d(10, display[1] - 40, "  Yellow sphere = ORIGIN (0,0,0)", font_small, (255, 255, 0))
-        draw_text_2d(10, display[1] - 55, "  Red sphere = Camera 1", font_small, (255, 100, 100))
-        draw_text_2d(10, display[1] - 70, "  Blue sphere = Camera 2", font_small, (100, 100, 255))
-        draw_text_2d(10, display[1] - 85, "  Axis: R=X, G=Y, B=Z", font_small, (200, 200, 200))
+        if show_labels or show_markers or show_camera_views:
+            draw_text_2d(10, display[1] - 20, "DEBUG:", font_small, (255, 200, 100))
+            draw_text_2d(10, display[1] - 40, "  Origin = yellow sphere", font_small, (255, 255, 0))
+            draw_text_2d(10, display[1] - 55, "  Axis: R=X, G=Y, B=Z", font_small, (200, 200, 200))
         
         # Marker legend
         if show_markers:
             draw_text_2d(10, 350, "AR MARKERS:", font_small, (255, 255, 0))
             y_offset = 330
             for marker_id, marker_data in MARKER_POSITIONS.items():
-                pos = marker_data['pos']
                 desc = marker_data['desc']
-                draw_text_2d(10, y_offset, f"  [{marker_id}] ({pos[0]}, {pos[1]}, {pos[2]}) - {desc}", font_small)
+                draw_text_2d(10, y_offset, f"  [{marker_id}] {desc}", font_small)
                 y_offset -= 16
         
         # HUD text in 3D view (bottom left)
@@ -3489,15 +4533,13 @@ def main():
         
         info_lines = [
             f"Light: ({light.position[0]:.0f}, {light.position[1]:.0f}, {light.position[2]:.0f}) cm",
-            f"DMX: {dmx_vals}",
             mode_text + pulse_text,
             prox_text,
-            f"Labels: {'ON' if show_labels else 'OFF'}  Markers: {'ON' if show_markers else 'OFF'}  Trends: {'ON' if show_trends else 'OFF'}",
         ]
         
         for i, line in enumerate(info_lines):
             # Highlight proximity line when someone is close
-            if i == 3 and prox_factor > 0.5:
+            if i == 2 and prox_factor > 0.5:
                 draw_text_2d(10, 100 + i * 18, line, font_small, (100, 255, 100))
             elif "⚡PULSE" in line:
                 draw_text_2d(10, 100 + i * 18, line, font_small, (255, 255, 100))
@@ -3518,7 +4560,7 @@ def main():
             trends_width = 260
             trends_height = 200
             trends_x = 10  # Same x as realtime trends
-            trends_y = display[1] - 100 - 640 - 10  # Below realtime trends panel (height=640)
+            trends_y = display[1] - 100 - 520 - 10  # Below realtime trends panel (height=520)
             draw_trends_visualization(current_daily_report, trends_x, trends_y, 
                                      trends_width, trends_height, font, font_small)
         elif show_trends and not current_daily_report:
@@ -3537,7 +4579,7 @@ def main():
             draw_text_2d(msg_x + 10, msg_y - 36, "(Auto at 12:01 AM)", font_small, (120, 120, 120))
         
         # Status text overlay (bottom center of 3D view)
-        if behavior_status['status_text'] and meta_params.status_text_enabled:
+        if behavior_status['status_text'] and meta_params.status_text_enabled and not show_trends:
             status = behavior_status['status_text']
             # Draw with a background
             glColor4f(0.0, 0.0, 0.0, 0.6)
@@ -3579,18 +4621,46 @@ def main():
             
             last_health_log = current_time
         
-        # Periodic database pruning (keep DB from growing forever)
+        # Periodic database pruning (aggregate then prune - keeps hourly stats forever)
         if current_time - last_db_prune >= DB_PRUNE_INTERVAL:
             try:
-                # Prune records older than retention period
-                cutoff = current_time - (DB_RETENTION_DAYS * 86400)
-                pruned = tracking_db.prune_old_records(cutoff)
-                if pruned > 0:
-                    logger.info(f"Pruned {pruned} old tracking records from database")
+                # Smart prune: aggregate old hours, then delete raw events
+                results = tracking_db.prune_with_aggregation(
+                    raw_retention_hours=DB_RAW_RETENTION_HOURS
+                )
+                if results['events_pruned'] > 0 or results['hours_aggregated'] > 0:
+                    logger.info(
+                        f"📊 DB maintenance: aggregated {results['hours_aggregated']} hours, "
+                        f"pruned {results['events_pruned']} events, "
+                        f"{results['behavior_pruned']} behavior records"
+                    )
             except Exception as e:
-                logger.warning(f"Database prune failed: {e}")
+                logger.warning(f"Database maintenance failed: {e}")
             
             last_db_prune = current_time
+        
+        # Hourly aggregation trigger (aggregate completed hour for fresh stats)
+        current_hour = datetime.now().hour
+        if current_hour != last_hour_aggregated:
+            try:
+                # Aggregate the hour that just ended
+                prev_hour = (current_hour - 1) % 24
+                if prev_hour > current_hour:  # Crossed midnight
+                    date_str = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+                else:
+                    date_str = datetime.now().strftime('%Y-%m-%d')
+                
+                stats = tracking_db.aggregate_hour(date_str, prev_hour)
+                if stats['total_events'] > 0:
+                    logger.info(
+                        f"📊 Hourly aggregate [{date_str} {prev_hour}:00]: "
+                        f"{stats['unique_people']} people, "
+                        f"{stats['active_count']} active, {stats['passive_count']} passive"
+                    )
+            except Exception as e:
+                logger.warning(f"Hourly aggregation failed: {e}")
+            
+            last_hour_aggregated = current_hour
     
     # Cleanup
     logger.info("Shutting down...")

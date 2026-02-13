@@ -657,7 +657,6 @@ function updateTuningBars() {
     const tuningRanges = [
         { key: 'short', weight: activity.short, available: latestRealtimeTrends?.short?.available },
         { key: 'med', weight: activity.medium, available: latestRealtimeTrends?.medium?.available },
-        { key: 'long', weight: activity.long, available: latestRealtimeTrends?.long?.available },
     ];
 
     tuningRanges.forEach((range) => {
@@ -665,13 +664,6 @@ function updateTuningBars() {
         const isAvailable = weight !== null;
         // Scale up for visibility: activity values are typically 0-0.3, show as % of 0.5 max
         const scaledWidth = isAvailable ? Math.min(weight / 0.5, 1) * 100 : 0;
-
-        if (range.key === 'long') {
-            const longRow = document.getElementById('trend-long-row');
-            if (longRow) {
-                longRow.style.display = isAvailable ? 'grid' : 'none';
-            }
-        }
 
         const activeEl = document.getElementById(`trend-${range.key}-bar-active`);
         const passiveEl = document.getElementById(`trend-${range.key}-bar-passive`);
