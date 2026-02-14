@@ -99,8 +99,8 @@ function init() {
     
     // Position camera higher and farther back to include more passive zone
     // Panels center at X = -150, passive zone ends around Z = 553
-    camera.position.set(-138.86, 607.56, 889.87);
-    camera.lookAt(-140.45, 18.08, 434.19);
+    camera.position.set(-966.49, 237.19, 341.12);
+    camera.lookAt(-259.6, -41.15, 185.83);
     
     // Renderer
     const canvas = document.getElementById('viewer');
@@ -114,7 +114,7 @@ function init() {
     
     // Orbit controls - allows user to rotate/pan/zoom camera
     controls = new OrbitControls(camera, renderer.domElement);
-    controls.target.set(-140.45, 18.08, 434.19);  // Look deeper into passive zone
+    controls.target.set(-259.6, -41.15, 185.83);  // Look deeper into passive zone
     controls.enableDamping = true;
     controls.dampingFactor = 0.05;
     controls.minDistance = 100;
