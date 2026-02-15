@@ -94,12 +94,15 @@ function init() {
     scene.background = new THREE.Color(0x0a0a0c);
     scene.fog = new THREE.Fog(0x0a0a0c, 800, 2000);
     
-    // Camera - fixed position for mobile portrait view
+    // Camera - responsive position for desktop vs mobile
     camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 1, 3000);
     
-    // Position camera higher and farther back to include more passive zone
-    // Panels center at X = -150, passive zone ends around Z = 553
-    camera.position.set(-966.49, 237.19, 341.12);
+    const isMobile = window.innerWidth < 768;
+    if (isMobile) {
+        camera.position.set(-1263.57, 157.17, 193.23);
+    } else {
+        camera.position.set(-966.49, 237.19, 341.12);
+    }
     camera.lookAt(-259.6, -41.15, 185.83);
     
     // Renderer
@@ -214,11 +217,6 @@ function createFloor() {
     floor.rotation.x = -Math.PI / 2;
     floor.position.set(CONFIG.TRACKZONE.center_x, 0, (CONFIG.TRACKZONE.offset_z - 200) / 2);
     scene.add(floor);
-    
-    // Grid lines for depth
-    const gridHelper = new THREE.GridHelper(500, 20, 0x333340, 0x222230);
-    gridHelper.position.set(CONFIG.TRACKZONE.center_x, 0.1, 0);
-    scene.add(gridHelper);
 }
 
 function createPanels() {
