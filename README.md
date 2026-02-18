@@ -14,14 +14,14 @@ No images of people are stored or transmitted. The vision system outputs only an
 
 ## Documentation
 
-| Document | Audience | Description |
-|----------|----------|-------------|
-| **[How It Works](docs/HOW_IT_WORKS.md)** | Everyone | Accessible overview of the installation — what visitors experience, the four behavior modes, and how the light learns over time |
-| **[Behavior System](docs/BEHAVIOR_SYSTEM.md)** | Developers | Complete technical reference for modes, gestures, dwell phases, personality sliders, trend analysis, and feedback learning |
-| **[Behavior Diagrams](docs/BEHAVIOR_DIAGRAMS.md)** | Developers | Visual architecture walkthrough — 8 Mermaid diagrams covering the full pipeline from camera to DMX |
-| **[Software Guide](docs/SOFTWARE_GUIDE.md)** | Developers | Application reference — hotkeys, slider parameters, OSC messages, database schema, and configuration files |
-| **[Hardware](docs/HARDWARE.md)** | Makers | Physical build details — panel units, wiring, DMX decoder, cameras, and network topology |
-| **[Production Setup](docs/PRODUCTION_SETUP.md)** | Operators | Deployment guide — systemd services, Tailscale Funnel, monitoring, and maintenance |
+| Document | Description |
+|----------|-------------|
+| **[How It Works](docs/HOW_IT_WORKS.md)** | Accessible overview of the installation — what visitors experience, the four behavior modes, and how the light learns over time |
+| **[Behavior System](docs/BEHAVIOR_SYSTEM.md)** | Complete technical reference for modes, gestures, dwell phases, personality sliders, trend analysis, and feedback learning |
+| **[Behavior Diagrams](docs/BEHAVIOR_DIAGRAMS.md)** | Visual architecture walkthrough — 8 Mermaid diagrams covering the full pipeline from camera to DMX |
+| **[Software Guide](docs/SOFTWARE_GUIDE.md)** | Application reference — hotkeys, slider parameters, OSC messages, database schema, and configuration files |
+| **[Hardware](docs/HARDWARE.md)** | Physical build details — panel units, wiring, DMX decoder, cameras, and network topology |
+| **[Production Setup](docs/PRODUCTION_SETUP.md)** | Deployment guide — systemd services, Tailscale Funnel, monitoring, and maintenance |
 
 ### Additional Resources
 
@@ -57,32 +57,19 @@ See [Production Setup](docs/PRODUCTION_SETUP.md) for 24/7 deployment with system
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        PRODUCTION MACHINE                           │
-│                                                                     │
-│  ┌──────────────────┐    OSC     ┌───────────────────────┐         │
-│  │ camera_tracker   │───7000───▶│  lightController      │         │
-│  │    _osc.py       │    UDP     │     _osc.py           │         │
-│  │                  │           │                       │         │
-│  │  YOLO detection  │           │  Behavior system      │         │
-│  │  2x RTSP cameras │           │  Art-Net DMX output   │         │
-│  │  ArUco calibration│          │  WebSocket server     │         │
-│  └────────┬─────────┘           └──────────┬────────────┘         │
-│           │ RTSP                   Art-Net  │  WebSocket           │
-│           ▼                         6454    │    8765              │
-│   ┌───────────────┐                  │      │                     │
-│   │   Cameras     │                  ▼      ▼                     │
-│   │  PoE network  │          ┌─────────┐  ┌──────────────┐       │
-│   └───────────────┘          │   DMX   │  │  Tailscale   │       │
-│                              │ Decoder │  │   Funnel     │       │
-└──────────────────────────────│─────────│──│──────────────│───────┘
-                               │         │  │              │
-                               ▼         │  ▼ HTTPS        │
-                        ┌──────────┐     │  ┌─────────────┐│
-                        │   LED    │     │  │ GitHub Pages ││
-                        │  Panels  │     │  │ Public Viewer││
-                        └──────────┘     │  └─────────────┘│
+```mermaid
+flowchart LR
+       subgraph PROD["PRODUCTION MACHINE"]
+              TRACKER["camera_tracker_osc.py<br/>YOLO detection<br/>2x RTSP cameras<br/>ArUco calibration"]
+              CONTROLLER["lightController_osc.py<br/>Behavior system<br/>Art-Net DMX output<br/>WebSocket server"]
+       end
+
+       CAMERAS["Cameras<br/>PoE network"] -->|"RTSP/TCP 555"| TRACKER
+       TRACKER -->|"OSC/UDP 7000"| CONTROLLER
+       CONTROLLER -->|"Art-Net/UDP 6454"| DMX["DMX Decoder"]
+       DMX --> LEDS["LED Panels"]
+       CONTROLLER -->|"WebSocket/TCP 8765"| FUNNEL["Tailscale Funnel"]
+       FUNNEL -->|"HTTPS"| VIEWER["GitHub Pages<br/>Public Viewer"]
 ```
 
 ### Network Ports
