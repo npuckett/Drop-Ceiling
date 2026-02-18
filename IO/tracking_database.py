@@ -18,6 +18,7 @@ import sqlite3
 import time
 import math
 import threading
+import json
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple
@@ -84,32 +85,129 @@ class TrackingDatabase:
     
     Automatically calculates velocity from consecutive position updates.
     Provides trend analysis over different time scales.
+    Uses batched commits for better performance (commits every 1 second or 50 writes).
     """
     
     def __init__(self, db_path: str = "tracking_history.db"):
         self.db_path = Path(db_path)
-        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
         self.lock = threading.Lock()
+        
+        # Check for corruption and recover if needed
+        self.conn = self._safe_connect()
+        self.conn.row_factory = sqlite3.Row
+        
+        # Enable WAL mode for better crash resilience
+        try:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=NORMAL")
+        except Exception:
+            pass
         
         # Track previous positions for velocity calculation
         self.prev_positions: Dict[int, Tuple[float, float, float, float]] = {}  # id -> (x, z, timestamp)
         
-        # Zone boundaries (should match lightController)
+        # Batched commit settings (for performance)
+        self._pending_writes = 0
+        self._last_commit_time = time.time()
+        self._commit_interval = 1.0  # Commit at least every 1 second
+        self._commit_batch_size = 50  # Or after 50 writes
+        
+        # Zone boundaries (MUST match lightController_osc.py zones)
+        # Active zone: close to installation (engaging with it)
+        # center_x=-150, width=260, offset_z=78, depth=205
         self.active_zone = {
-            'x_min': 120 - 475/2,  # -117.5
-            'x_max': 120 + 475/2,  # 357.5
+            'x_min': -150 - 260/2,  # -280
+            'x_max': -150 + 260/2,  # -20
             'z_min': 78,
-            'z_max': 78 + 205,     # 283
+            'z_max': 78 + 205,      # 283
         }
+        # Passive zone: further out on sidewalk (passing by)
+        # center_x=-150, width=400, offset_z=283, depth=270
         self.passive_zone = {
-            'x_min': 120 - 650/2,  # -205
-            'x_max': 120 + 650/2,  # 445
+            'x_min': -150 - 400/2,  # -350
+            'x_max': -150 + 400/2,  # 50
             'z_min': 283,
-            'z_max': 283 + 330,    # 613
+            'z_max': 283 + 270,     # 553
         }
         
         self._create_tables()
+    
+    def _safe_connect(self) -> sqlite3.Connection:
+        """Connect to database with integrity check. Auto-recovers if corrupted."""
+        if not self.db_path.exists():
+            print(f"\U0001f4be Creating new tracking database: {self.db_path}")
+            return sqlite3.connect(str(self.db_path), check_same_thread=False)
+        
+        try:
+            conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+            result = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            if result == "ok":
+                return conn
+            else:
+                print(f"\u26a0\ufe0f Database integrity check failed: {result}")
+                conn.close()
+                return self._recover_database()
+        except sqlite3.DatabaseError as e:
+            print(f"\u26a0\ufe0f Database error on open: {e}")
+            return self._recover_database()
+    
+    def _recover_database(self) -> sqlite3.Connection:
+        """Attempt to recover a corrupted database. Falls back to fresh DB."""
+        import subprocess
+        backup_path = self.db_path.with_suffix(
+            f".db.bak.corrupted_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
+        print(f"\U0001f4e6 Backing up corrupted DB to: {backup_path}")
+        
+        try:
+            import shutil
+            shutil.copy2(str(self.db_path), str(backup_path))
+        except Exception as e:
+            print(f"  Backup failed: {e}")
+        
+        # Try to recover using sqlite3 .recover command
+        recovered_path = self.db_path.with_suffix(".db.recovered")
+        try:
+            result = subprocess.run(
+                ['sqlite3', str(self.db_path), '.recover'],
+                capture_output=True, text=True, timeout=60
+            )
+            if result.stdout.strip():
+                subprocess.run(
+                    ['sqlite3', str(recovered_path)],
+                    input=result.stdout, capture_output=True, text=True, timeout=60
+                )
+                # Check if recovery has any data
+                test_conn = sqlite3.connect(str(recovered_path))
+                tables = test_conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+                test_conn.close()
+                
+                if tables:
+                    print(f"\u2705 Recovered database with {len(tables)} tables")
+                    self.db_path.unlink()
+                    recovered_path.rename(self.db_path)
+                    # Remove leftover journal
+                    journal = self.db_path.with_suffix(".db-journal")
+                    if journal.exists():
+                        journal.unlink()
+                    return sqlite3.connect(str(self.db_path), check_same_thread=False)
+                else:
+                    print("\u26a0\ufe0f Recovery produced empty database")
+                    recovered_path.unlink(missing_ok=True)
+        except Exception as e:
+            print(f"\u26a0\ufe0f Recovery failed: {e}")
+            recovered_path.unlink(missing_ok=True)
+        
+        # Last resort: start fresh
+        print("\U0001f195 Creating fresh database (old data preserved in backup)")
+        self.db_path.unlink(missing_ok=True)
+        # Remove leftover journal
+        journal = self.db_path.with_suffix(".db-journal")
+        if journal.exists():
+            journal.unlink()
+        return sqlite3.connect(str(self.db_path), check_same_thread=False)
     
     def _create_tables(self):
         """Create database tables if they don't exist"""
@@ -211,6 +309,27 @@ class TrackingDatabase:
                 CREATE INDEX IF NOT EXISTS idx_light_mode 
                 ON light_behavior(mode)
             ''')
+
+            # Auto-adjustment history (behavior tuning events)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS behavior_adjustments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp REAL NOT NULL,
+                    datetime TEXT NOT NULL,
+                    enabled INTEGER NOT NULL,
+                    reason TEXT,
+                    short_activity REAL,
+                    medium_activity REAL,
+                    long_activity REAL,
+                    energy_level REAL,
+                    aggression_level REAL,
+                    adjustments_json TEXT
+                )
+            ''')
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_adjustments_timestamp
+                ON behavior_adjustments(timestamp)
+            ''')
             
             # Person sessions (tracks individual visit durations)
             cursor.execute('''
@@ -225,6 +344,110 @@ class TrackingDatabase:
                     avg_speed REAL
                 )
             ''')
+            
+            # Hourly statistics (aggregated from raw events - kept forever)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS hourly_stats (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT NOT NULL,
+                    hour INTEGER NOT NULL,
+                    total_events INTEGER DEFAULT 0,
+                    unique_people INTEGER DEFAULT 0,
+                    active_count INTEGER DEFAULT 0,
+                    passive_count INTEGER DEFAULT 0,
+                    avg_speed REAL DEFAULT 0,
+                    left_to_right INTEGER DEFAULT 0,
+                    right_to_left INTEGER DEFAULT 0,
+                    bloom_count INTEGER DEFAULT 0,
+                    dominant_mode TEXT,
+                    avg_brightness REAL DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(date, hour)
+                )
+            ''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_hourly_date ON hourly_stats(date)')
+            
+            # Daily statistics (aggregated from hourly - kept forever)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS daily_stats_v2 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT NOT NULL UNIQUE,
+                    total_events INTEGER DEFAULT 0,
+                    unique_people INTEGER DEFAULT 0,
+                    total_active INTEGER DEFAULT 0,
+                    total_passive INTEGER DEFAULT 0,
+                    total_blooms INTEGER DEFAULT 0,
+                    peak_hour INTEGER,
+                    peak_count INTEGER,
+                    quietest_hour INTEGER,
+                    dominant_flow TEXT,
+                    flow_balance REAL DEFAULT 0,
+                    avg_speed REAL DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Auto-tune daily learnings (what the system learned each day)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS autotune_daily_learnings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT NOT NULL UNIQUE,
+                    total_adjustments INTEGER DEFAULT 0,
+                    total_unique_people INTEGER DEFAULT 0,
+                    peak_hour INTEGER,
+                    optimal_values_json TEXT,
+                    param_journeys_json TEXT,
+                    hourly_activity_json TEXT,
+                    strategy_summary TEXT,
+                    learned_caps_json TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_learnings_date ON autotune_daily_learnings(date)')
+            
+            # Meta-tuning reviews (periodic automated analysis of auto-tuner performance)
+            # Written by the meta-tuner program (autotune_meta_review.py) 3x/day
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS meta_tuning_reviews (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp REAL NOT NULL,
+                    datetime TEXT NOT NULL,
+                    review_window_hours REAL NOT NULL,
+                    
+                    -- Analysis results
+                    total_adjustments INTEGER DEFAULT 0,
+                    total_tracking_events INTEGER DEFAULT 0,
+                    unique_people INTEGER DEFAULT 0,
+                    
+                    -- Activity level stats
+                    avg_short_activity REAL,
+                    median_short_activity REAL,
+                    avg_medium_activity REAL,
+                    avg_energy_level REAL,
+                    
+                    -- Floor/ceiling clamping analysis
+                    pct_at_floor_json TEXT,
+                    pct_at_ceiling_json TEXT,
+                    
+                    -- Light mode distribution
+                    mode_distribution_json TEXT,
+                    
+                    -- Parameter stats (avg/min/max for each param)
+                    param_stats_json TEXT,
+                    
+                    -- Changes applied
+                    old_config_json TEXT,
+                    new_config_json TEXT,
+                    changes_summary TEXT,
+                    
+                    -- Diagnostics
+                    diagnosis TEXT,
+                    recommendations_json TEXT,
+                    
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_meta_timestamp ON meta_tuning_reviews(timestamp)')
             
             self.conn.commit()
     
@@ -245,6 +468,7 @@ class TrackingDatabase:
                         timestamp: Optional[float] = None):
         """
         Record a position update with automatic velocity calculation.
+        Uses batched commits for better performance.
         
         Args:
             person_id: Unique ID of tracked person
@@ -280,14 +504,25 @@ class TrackingDatabase:
         # Store in database
         dt_str = datetime.fromtimestamp(timestamp).isoformat()
         
-        with self.lock:
-            cursor = self.conn.cursor()
-            cursor.execute('''
-                INSERT INTO tracking_events 
-                (timestamp, datetime, person_id, x, z, vx, vz, speed, zone, flow_direction)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (timestamp, dt_str, person_id, x, z, vx, vz, speed, zone.value, flow_dir))
-            self.conn.commit()
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    INSERT INTO tracking_events 
+                    (timestamp, datetime, person_id, x, z, vx, vz, speed, zone, flow_direction)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (timestamp, dt_str, person_id, x, z, vx, vz, speed, zone.value, flow_dir))
+                
+                # Batched commit: only commit when batch is full or interval elapsed
+                self._pending_writes += 1
+                now = time.time()
+                if self._pending_writes >= self._commit_batch_size or \
+                   now - self._last_commit_time >= self._commit_interval:
+                    self.conn.commit()
+                    self._pending_writes = 0
+                    self._last_commit_time = now
+        except sqlite3.DatabaseError as e:
+            print(f"\u26a0\ufe0f DB write error in record_position: {e}")
     
     def remove_person(self, person_id: int):
         """Called when a person leaves tracking - cleans up velocity state"""
@@ -307,27 +542,290 @@ class TrackingDatabase:
         """
         Record the light's current state for self-analysis.
         Call this periodically (0.5s when active, 2s when idle).
+        Uses batched commits for better performance.
         """
         if timestamp is None:
             timestamp = time.time()
         
         dt_str = datetime.fromtimestamp(timestamp).isoformat()
         
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    INSERT INTO light_behavior 
+                    (timestamp, datetime, mode, position_x, position_y, position_z,
+                     target_x, target_y, target_z, brightness, pulse_speed, move_speed,
+                     people_count, active_count, passive_count, gesture_type, status_text)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (timestamp, dt_str, mode, 
+                      position[0], position[1], position[2],
+                      target[0], target[1], target[2],
+                      brightness, pulse_speed, move_speed,
+                      people_count, active_count, passive_count,
+                      gesture_type, status_text))
+                
+                # Batched commit: only commit when batch is full or interval elapsed
+                self._pending_writes += 1
+                now = time.time()
+                if self._pending_writes >= self._commit_batch_size or \
+                   now - self._last_commit_time >= self._commit_interval:
+                    self.conn.commit()
+                    self._pending_writes = 0
+                    self._last_commit_time = now
+        except sqlite3.DatabaseError as e:
+            print(f"\u26a0\ufe0f DB write error in record_light_state: {e}")
+
+    def record_behavior_adjustment(self, enabled: bool, reason: str,
+                                   short_activity: float, medium_activity: float,
+                                   long_activity: float, energy_level: float,
+                                   aggression_level: float, adjustments: Dict,
+                                   timestamp: float = None):
+        """
+        Record an auto-tuning adjustment event.
+
+        adjustments is a dict that should include old/new values and deltas.
+        """
+        if timestamp is None:
+            timestamp = time.time()
+
+        dt_str = datetime.fromtimestamp(timestamp).isoformat()
+        adjustments_json = json.dumps(adjustments, separators=(',', ':'))
+
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    INSERT INTO behavior_adjustments
+                    (timestamp, datetime, enabled, reason, short_activity, medium_activity,
+                     long_activity, energy_level, aggression_level, adjustments_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (timestamp, dt_str, int(enabled), reason, short_activity,
+                      medium_activity, long_activity, energy_level, aggression_level,
+                      adjustments_json))
+
+                # Batched commit: only commit when batch is full or interval elapsed
+                self._pending_writes += 1
+                now = time.time()
+                if self._pending_writes >= self._commit_batch_size or \
+                   now - self._last_commit_time >= self._commit_interval:
+                    self.conn.commit()
+                    self._pending_writes = 0
+                    self._last_commit_time = now
+        except sqlite3.DatabaseError as e:
+            print(f"\u26a0\ufe0f DB write error in record_behavior_adjustment: {e}")
+
+    def get_daily_adjustments(self, date_str: str) -> Dict:
+        """
+        Get auto-tuning adjustment analysis for a specific day.
+        Returns summary of parameter changes, strategies used, and trends.
+        
+        Args:
+            date_str: Date in YYYY-MM-DD format
+        """
+        start_dt = datetime.strptime(date_str, '%Y-%m-%d')
+        end_dt = start_dt + timedelta(days=1)
+        start_ts = start_dt.timestamp()
+        end_ts = end_dt.timestamp()
+        
         with self.lock:
             cursor = self.conn.cursor()
             cursor.execute('''
-                INSERT INTO light_behavior 
-                (timestamp, datetime, mode, position_x, position_y, position_z,
-                 target_x, target_y, target_z, brightness, pulse_speed, move_speed,
-                 people_count, active_count, passive_count, gesture_type, status_text)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (timestamp, dt_str, mode, 
-                  position[0], position[1], position[2],
-                  target[0], target[1], target[2],
-                  brightness, pulse_speed, move_speed,
-                  people_count, active_count, passive_count,
-                  gesture_type, status_text))
+                SELECT timestamp, short_activity, medium_activity, long_activity,
+                       energy_level, aggression_level, adjustments_json
+                FROM behavior_adjustments
+                WHERE timestamp >= ? AND timestamp < ? AND enabled = 1
+                ORDER BY timestamp
+            ''', (start_ts, end_ts))
+            
+            rows = cursor.fetchall()
+            
+        if not rows:
+            return {
+                'total_adjustments': 0,
+                'param_journeys': {},
+                'hourly_activity': {},
+                'strategy_summary': 'No auto-tuning adjustments recorded.',
+            }
+        
+        # Track parameter evolution over the day
+        param_start = {}  # First values seen
+        param_end = {}    # Last values seen
+        param_min = {}    # Minimum values
+        param_max = {}    # Maximum values
+        param_total_delta = {}  # Sum of absolute deltas
+        hourly_adjustment_counts = {}  # Adjustments per hour
+        hourly_activity_levels = {}    # Activity levels per hour
+        
+        for row in rows:
+            ts = row['timestamp']
+            hour = datetime.fromtimestamp(ts).hour
+            hourly_adjustment_counts[hour] = hourly_adjustment_counts.get(hour, 0) + 1
+            
+            # Track activity levels by hour
+            if hour not in hourly_activity_levels:
+                hourly_activity_levels[hour] = []
+            hourly_activity_levels[hour].append({
+                'short': row['short_activity'],
+                'medium': row['medium_activity'],
+                'long': row['long_activity'],
+                'energy': row['energy_level'],
+                'aggression': row['aggression_level'],
+            })
+            
+            try:
+                adj = json.loads(row['adjustments_json'])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            
+            new_values = adj.get('new_values', {})
+            applied_deltas = adj.get('applied_deltas', {})
+            
+            for name, val in new_values.items():
+                if name not in param_start:
+                    # First occurrence - set from old_values
+                    old_vals = adj.get('old_values', {})
+                    param_start[name] = old_vals.get(name, val)
+                    param_min[name] = param_start[name]
+                    param_max[name] = param_start[name]
+                    param_total_delta[name] = 0.0
+                
+                param_end[name] = val
+                param_min[name] = min(param_min[name], val)
+                param_max[name] = max(param_max[name], val)
+            
+            for name, delta in applied_deltas.items():
+                param_total_delta[name] = param_total_delta.get(name, 0.0) + abs(delta)
+        
+        # Build parameter journeys
+        param_journeys = {}
+        for name in param_start:
+            net_change = param_end.get(name, 0) - param_start.get(name, 0)
+            param_journeys[name] = {
+                'start': round(param_start[name], 3),
+                'end': round(param_end[name], 3),
+                'min': round(param_min[name], 3),
+                'max': round(param_max[name], 3),
+                'net_change': round(net_change, 3),
+                'total_movement': round(param_total_delta.get(name, 0), 3),
+                'direction': 'up' if net_change > 0.01 else ('down' if net_change < -0.01 else 'stable'),
+            }
+        
+        # Identify strategies: which params moved the most and in which direction
+        sorted_by_movement = sorted(param_journeys.items(), 
+                                     key=lambda kv: kv[1]['total_movement'], reverse=True)
+        most_active_params = sorted_by_movement[:5]
+        
+        # Build strategy narrative
+        strategies = []
+        for name, journey in most_active_params:
+            if journey['total_movement'] < 0.01:
+                continue
+            direction = journey['direction']
+            label = name.replace('_', ' ').title()
+            if direction == 'up':
+                strategies.append(f"{label} increased {journey['start']:.2f} → {journey['end']:.2f} (range {journey['min']:.2f}–{journey['max']:.2f})")
+            elif direction == 'down':
+                strategies.append(f"{label} decreased {journey['start']:.2f} → {journey['end']:.2f} (range {journey['min']:.2f}–{journey['max']:.2f})")
+            else:
+                strategies.append(f"{label} explored around {journey['end']:.2f} (range {journey['min']:.2f}–{journey['max']:.2f})")
+        
+        # Compute avg activity per hour
+        hourly_activity = {}
+        for hour, levels in hourly_activity_levels.items():
+            hourly_activity[hour] = {
+                'adjustments': hourly_adjustment_counts[hour],
+                'avg_short_activity': round(sum(l['short'] for l in levels) / len(levels), 3),
+                'avg_energy': round(sum(l['energy'] for l in levels) / len(levels), 3),
+                'avg_aggression': round(sum(l['aggression'] for l in levels) / len(levels), 3),
+            }
+        
+        return {
+            'total_adjustments': len(rows),
+            'param_journeys': param_journeys,
+            'hourly_activity': hourly_activity,
+            'most_tuned_params': [name for name, _ in most_active_params if _['total_movement'] >= 0.01],
+            'strategy_summary': '; '.join(strategies) if strategies else 'Minimal tuning activity.',
+        }
+    
+    def save_autotune_learnings(self, date_str: str, report_data: Dict, 
+                                 tuning_analysis: Dict, optimal_values: Dict = None,
+                                 learned_caps: Dict = None):
+        """
+        Save auto-tune daily learnings derived from the daily report analysis.
+        
+        Args:
+            date_str: Date in YYYY-MM-DD format
+            report_data: Dict with total_unique_people, peak_hour etc.
+            tuning_analysis: The auto_tuning_analysis from the daily report
+            optimal_values: Computed optimal starting values for next day
+            learned_caps: Any adjusted caps based on the day's experience
+        """
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO autotune_daily_learnings 
+                (date, total_adjustments, total_unique_people, peak_hour,
+                 optimal_values_json, param_journeys_json, hourly_activity_json,
+                 strategy_summary, learned_caps_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                date_str,
+                tuning_analysis.get('total_adjustments', 0),
+                report_data.get('total_unique_people', 0),
+                report_data.get('peak_hour', 0),
+                json.dumps(optimal_values or {}),
+                json.dumps(tuning_analysis.get('param_journeys', {})),
+                json.dumps(tuning_analysis.get('hourly_activity', {})),
+                tuning_analysis.get('strategy_summary', ''),
+                json.dumps(learned_caps or {}),
+            ))
             self.conn.commit()
+    
+    def get_recent_autotune_learnings(self, days: int = 7) -> List[Dict]:
+        """
+        Get the most recent auto-tune learnings from the database.
+        Returns a list of daily learning records, newest first.
+        
+        Args:
+            days: Number of days of history to retrieve
+        """
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                SELECT date, total_adjustments, total_unique_people, peak_hour,
+                       optimal_values_json, param_journeys_json, hourly_activity_json,
+                       strategy_summary, learned_caps_json
+                FROM autotune_daily_learnings
+                ORDER BY date DESC
+                LIMIT ?
+            ''', (days,))
+            
+            rows = cursor.fetchall()
+            
+        results = []
+        for row in rows:
+            try:
+                optimal = json.loads(row['optimal_values_json']) if row['optimal_values_json'] else {}
+                journeys = json.loads(row['param_journeys_json']) if row['param_journeys_json'] else {}
+                hourly = json.loads(row['hourly_activity_json']) if row['hourly_activity_json'] else {}
+                caps = json.loads(row['learned_caps_json']) if row['learned_caps_json'] else {}
+            except (json.JSONDecodeError, TypeError):
+                optimal, journeys, hourly, caps = {}, {}, {}, {}
+            
+            results.append({
+                'date': row['date'],
+                'total_adjustments': row['total_adjustments'],
+                'total_unique_people': row['total_unique_people'],
+                'peak_hour': row['peak_hour'],
+                'optimal_values': optimal,
+                'param_journeys': journeys,
+                'hourly_activity': hourly,
+                'strategy_summary': row['strategy_summary'],
+                'learned_caps': caps,
+            })
+        
+        return results
     
     def get_light_position_history(self, minutes: int = 5) -> List[Tuple[float, float, float]]:
         """Get recent light positions for pattern analysis"""
@@ -511,6 +1009,16 @@ class TrackingDatabase:
             ''', (one_minute_ago,))
             
             row = cursor.fetchone()
+            
+            # Also get today's unique people count
+            today_str = datetime.now().strftime('%Y-%m-%d')
+            cursor.execute('''
+                SELECT COUNT(DISTINCT person_id) as daily_unique
+                FROM tracking_events
+                WHERE datetime >= ?
+            ''', (today_str,))
+            daily_row = cursor.fetchone()
+            
             return {
                 'people_last_minute': row['people'] or 0,
                 'avg_speed': row['avg_speed'] or 0,
@@ -518,6 +1026,7 @@ class TrackingDatabase:
                 'passive_events': row['passive_events'] or 0,
                 'flow_left_to_right': row['ltr'] or 0,
                 'flow_right_to_left': row['rtl'] or 0,
+                'daily_unique_people': daily_row['daily_unique'] or 0,
             }
     
     def get_trends(self, minutes: int = 60) -> TrendSummary:
@@ -655,6 +1164,222 @@ class TrackingDatabase:
             
             self.conn.commit()
     
+    # =========================================================================
+    # AGGREGATION METHODS (for long-term data retention)
+    # =========================================================================
+    
+    def aggregate_hour(self, date_str: str, hour: int) -> dict:
+        """
+        Aggregate raw events for a specific hour into hourly_stats.
+        Call this at the END of each hour or during maintenance.
+        
+        Returns stats dict for logging/verification.
+        """
+        # Calculate time bounds
+        start_dt = datetime.strptime(f"{date_str} {hour:02d}:00:00", "%Y-%m-%d %H:%M:%S")
+        end_dt = start_dt + timedelta(hours=1)
+        start_ts = start_dt.timestamp()
+        end_ts = end_dt.timestamp()
+        
+        with self.lock:
+            cursor = self.conn.cursor()
+            
+            # Aggregate tracking events
+            cursor.execute('''
+                SELECT 
+                    COUNT(*) as total_events,
+                    COUNT(DISTINCT person_id) as unique_people,
+                    SUM(CASE WHEN zone = 'active' THEN 1 ELSE 0 END) as active_count,
+                    SUM(CASE WHEN zone = 'passive' THEN 1 ELSE 0 END) as passive_count,
+                    AVG(speed) as avg_speed,
+                    SUM(CASE WHEN flow_direction = 'left_to_right' THEN 1 ELSE 0 END) as ltr,
+                    SUM(CASE WHEN flow_direction = 'right_to_left' THEN 1 ELSE 0 END) as rtl
+                FROM tracking_events
+                WHERE timestamp >= ? AND timestamp < ?
+            ''', (start_ts, end_ts))
+            tracking = cursor.fetchone()
+            
+            # Aggregate light behavior
+            cursor.execute('''
+                SELECT 
+                    COUNT(*) as behavior_count,
+                    AVG(brightness) as avg_brightness
+                FROM light_behavior
+                WHERE timestamp >= ? AND timestamp < ?
+            ''', (start_ts, end_ts))
+            behavior = cursor.fetchone()
+            
+            # Get dominant mode
+            cursor.execute('''
+                SELECT mode, COUNT(*) as cnt
+                FROM light_behavior
+                WHERE timestamp >= ? AND timestamp < ?
+                GROUP BY mode ORDER BY cnt DESC LIMIT 1
+            ''', (start_ts, end_ts))
+            mode_row = cursor.fetchone()
+            dominant_mode = mode_row[0] if mode_row else 'unknown'
+            
+            # Build stats dict
+            stats = {
+                'date': date_str,
+                'hour': hour,
+                'total_events': tracking[0] or 0,
+                'unique_people': tracking[1] or 0,
+                'active_count': tracking[2] or 0,
+                'passive_count': tracking[3] or 0,
+                'avg_speed': tracking[4] or 0.0,
+                'left_to_right': tracking[5] or 0,
+                'right_to_left': tracking[6] or 0,
+                'dominant_mode': dominant_mode,
+                'avg_brightness': behavior[1] or 0.0 if behavior else 0.0,
+            }
+            
+            # Insert or update hourly stats
+            cursor.execute('''
+                INSERT OR REPLACE INTO hourly_stats 
+                (date, hour, total_events, unique_people, active_count, passive_count,
+                 avg_speed, left_to_right, right_to_left, dominant_mode, avg_brightness)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (stats['date'], stats['hour'], stats['total_events'], 
+                  stats['unique_people'], stats['active_count'], stats['passive_count'],
+                  stats['avg_speed'], stats['left_to_right'], stats['right_to_left'],
+                  stats['dominant_mode'], stats['avg_brightness']))
+            
+            self.conn.commit()
+            return stats
+    
+    def aggregate_day(self, date_str: str) -> dict:
+        """
+        Aggregate hourly stats into daily summary.
+        Call this at midnight for the previous day.
+        """
+        with self.lock:
+            cursor = self.conn.cursor()
+            
+            cursor.execute('''
+                SELECT 
+                    SUM(total_events) as total_events,
+                    SUM(unique_people) as unique_people,
+                    SUM(active_count) as total_active,
+                    SUM(passive_count) as total_passive,
+                    AVG(avg_speed) as avg_speed,
+                    SUM(left_to_right) as ltr,
+                    SUM(right_to_left) as rtl
+                FROM hourly_stats
+                WHERE date = ?
+            ''', (date_str,))
+            row = cursor.fetchone()
+            
+            if not row or row[0] is None:
+                return {'date': date_str, 'total_events': 0}
+            
+            # Find peak and quietest hours
+            cursor.execute('''
+                SELECT hour, total_events FROM hourly_stats
+                WHERE date = ? ORDER BY total_events DESC LIMIT 1
+            ''', (date_str,))
+            peak = cursor.fetchone()
+            
+            cursor.execute('''
+                SELECT hour, total_events FROM hourly_stats
+                WHERE date = ? AND total_events > 0 ORDER BY total_events ASC LIMIT 1
+            ''', (date_str,))
+            quietest = cursor.fetchone()
+            
+            ltr = row[5] or 0
+            rtl = row[6] or 0
+            flow_balance = (ltr - rtl) / (ltr + rtl) if (ltr + rtl) > 0 else 0
+            dominant_flow = 'left_to_right' if ltr > rtl else 'right_to_left' if rtl > ltr else 'balanced'
+            
+            stats = {
+                'date': date_str,
+                'total_events': row[0] or 0,
+                'unique_people': row[1] or 0,
+                'total_active': row[2] or 0,
+                'total_passive': row[3] or 0,
+                'avg_speed': row[4] or 0.0,
+                'peak_hour': peak[0] if peak else 0,
+                'peak_count': peak[1] if peak else 0,
+                'quietest_hour': quietest[0] if quietest else 0,
+                'dominant_flow': dominant_flow,
+                'flow_balance': flow_balance,
+            }
+            
+            cursor.execute('''
+                INSERT OR REPLACE INTO daily_stats_v2
+                (date, total_events, unique_people, total_active, total_passive,
+                 avg_speed, peak_hour, peak_count, quietest_hour, dominant_flow, flow_balance)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (stats['date'], stats['total_events'], stats['unique_people'],
+                  stats['total_active'], stats['total_passive'], stats['avg_speed'],
+                  stats['peak_hour'], stats['peak_count'], stats['quietest_hour'],
+                  stats['dominant_flow'], stats['flow_balance']))
+            
+            self.conn.commit()
+            return stats
+    
+    def prune_with_aggregation(self, raw_retention_hours: int = 48) -> dict:
+        """
+        Smart pruning: aggregate before deleting.
+        
+        1. Aggregate any un-aggregated hours from raw data
+        2. Delete raw events older than retention_hours
+        3. Hourly stats are kept FOREVER
+        
+        Returns dict with counts of aggregated/pruned records.
+        """
+        now = datetime.now()
+        results = {'hours_aggregated': 0, 'events_pruned': 0, 'behavior_pruned': 0}
+        
+        cutoff_raw = now - timedelta(hours=raw_retention_hours)
+        cutoff_ts = cutoff_raw.timestamp()
+        
+        # Find hours that need aggregation (have raw data but no hourly_stats)
+        with self.lock:
+            cursor = self.conn.cursor()
+            
+            # Get distinct date/hour combinations from old events
+            cursor.execute('''
+                SELECT DISTINCT 
+                    date(datetime) as date,
+                    CAST(strftime('%H', datetime) AS INTEGER) as hour
+                FROM tracking_events
+                WHERE timestamp < ?
+            ''', (cutoff_ts,))
+            old_hours = cursor.fetchall()
+        
+        # Aggregate each hour that's about to be pruned
+        for date_str, hour in old_hours:
+            # Check if already aggregated
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    'SELECT 1 FROM hourly_stats WHERE date = ? AND hour = ?',
+                    (date_str, hour)
+                )
+                if cursor.fetchone():
+                    continue  # Already aggregated
+            
+            try:
+                self.aggregate_hour(date_str, hour)
+                results['hours_aggregated'] += 1
+            except Exception as e:
+                print(f"Warning: Failed to aggregate {date_str} hour {hour}: {e}")
+        
+        # Now safe to delete old raw events
+        with self.lock:
+            cursor = self.conn.cursor()
+            
+            cursor.execute('DELETE FROM tracking_events WHERE timestamp < ?', (cutoff_ts,))
+            results['events_pruned'] = cursor.rowcount
+            
+            cursor.execute('DELETE FROM light_behavior WHERE timestamp < ?', (cutoff_ts,))
+            results['behavior_pruned'] = cursor.rowcount
+            
+            self.conn.commit()
+        
+        return results
+    
     def cleanup_old_events(self, keep_days: int = 30):
         """Remove raw events older than N days (keeps summaries)"""
         cutoff = datetime.now() - timedelta(days=keep_days)
@@ -676,8 +1401,99 @@ class TrackingDatabase:
             self.conn.commit()
             return deleted
     
+    def save_meta_tuning_review(self, review: Dict):
+        """
+        Save a meta-tuning review (periodic automated analysis of auto-tuner performance).
+        Written by autotune_meta_review.py 3x/day.
+        """
+        with self.lock:
+            cursor = self.conn.cursor()
+            now = time.time()
+            cursor.execute('''
+                INSERT INTO meta_tuning_reviews (
+                    timestamp, datetime, review_window_hours,
+                    total_adjustments, total_tracking_events, unique_people,
+                    avg_short_activity, median_short_activity, avg_medium_activity, avg_energy_level,
+                    pct_at_floor_json, pct_at_ceiling_json,
+                    mode_distribution_json, param_stats_json,
+                    old_config_json, new_config_json, changes_summary,
+                    diagnosis, recommendations_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                now,
+                datetime.now().isoformat(),
+                review.get('review_window_hours', 8),
+                review.get('total_adjustments', 0),
+                review.get('total_tracking_events', 0),
+                review.get('unique_people', 0),
+                review.get('avg_short_activity'),
+                review.get('median_short_activity'),
+                review.get('avg_medium_activity'),
+                review.get('avg_energy_level'),
+                json.dumps(review.get('pct_at_floor', {})),
+                json.dumps(review.get('pct_at_ceiling', {})),
+                json.dumps(review.get('mode_distribution', {})),
+                json.dumps(review.get('param_stats', {})),
+                json.dumps(review.get('old_config', {})),
+                json.dumps(review.get('new_config', {})),
+                review.get('changes_summary', ''),
+                review.get('diagnosis', ''),
+                json.dumps(review.get('recommendations', [])),
+            ))
+            self.conn.commit()
+    
+    def get_recent_meta_reviews(self, limit: int = 10) -> List[Dict]:
+        """
+        Get the most recent meta-tuning reviews.
+        """
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                SELECT * FROM meta_tuning_reviews
+                ORDER BY timestamp DESC
+                LIMIT ?
+            ''', (limit,))
+            rows = cursor.fetchall()
+        
+        results = []
+        for row in rows:
+            try:
+                results.append({
+                    'id': row['id'],
+                    'datetime': row['datetime'],
+                    'review_window_hours': row['review_window_hours'],
+                    'total_adjustments': row['total_adjustments'],
+                    'total_tracking_events': row['total_tracking_events'],
+                    'unique_people': row['unique_people'],
+                    'avg_short_activity': row['avg_short_activity'],
+                    'median_short_activity': row['median_short_activity'],
+                    'avg_medium_activity': row['avg_medium_activity'],
+                    'avg_energy_level': row['avg_energy_level'],
+                    'pct_at_floor': json.loads(row['pct_at_floor_json'] or '{}'),
+                    'pct_at_ceiling': json.loads(row['pct_at_ceiling_json'] or '{}'),
+                    'mode_distribution': json.loads(row['mode_distribution_json'] or '{}'),
+                    'param_stats': json.loads(row['param_stats_json'] or '{}'),
+                    'old_config': json.loads(row['old_config_json'] or '{}'),
+                    'new_config': json.loads(row['new_config_json'] or '{}'),
+                    'changes_summary': row['changes_summary'],
+                    'diagnosis': row['diagnosis'],
+                    'recommendations': json.loads(row['recommendations_json'] or '[]'),
+                })
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return results
+
+    def flush(self):
+        """Commit any pending writes immediately"""
+        with self.lock:
+            if self._pending_writes > 0:
+                self.conn.commit()
+                self._pending_writes = 0
+                self._last_commit_time = time.time()
+    
     def close(self):
-        """Close database connection"""
+        """Close database connection, committing any pending writes"""
+        self.flush()
         self.conn.close()
 
 

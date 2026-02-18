@@ -86,6 +86,10 @@ import json
 # CONFIGURATION (all units in centimeters)
 # =============================================================================
 
+# Resolve all relative paths to this script's directory (IO/)
+# This ensures the DB is always in the same place regardless of cwd
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # OSC settings
 OSC_IP = "0.0.0.0"  # Listen on all interfaces
 OSC_PORT = 7000
@@ -153,6 +157,7 @@ def release_single_instance_lock():
 # =============================================================================
 
 SLIDER_SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'slider_settings.json')
+AUTOTUNE_OVERRIDES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'autotune_overrides.json')
 
 def load_slider_settings() -> dict:
     """Load slider settings from JSON file"""
@@ -1129,7 +1134,7 @@ class AutoTuningConfig:
     target_activity: float = 0.5
     damping_strong: float = 0.4
     damping_moderate: float = 0.7
-    budget_cost_scale: float = 40.0
+    budget_cost_scale: float = 60.0
 
 
 class AutoTuningManager:
@@ -1143,7 +1148,7 @@ class AutoTuningManager:
         self.last_adjustment: Optional[dict] = None
         self.revision = 0
         self.history: List[dict] = []
-        self.budget_current = 60.0
+        self.budget_current = 30.0
         self.budget_last_time = time.time()
 
         self.param_order = [
@@ -1193,23 +1198,223 @@ class AutoTuningManager:
         }
         
         # Safe minimums — auto-tuner cannot push below these
-        # Prevents the "crash to floor" problem when activity is persistently high
+        # Raised significantly to prevent the "zombie light" problem
+        # (bright but unresponsive when activity is high)
         self.safe_floors = {
-            'responsiveness': 0.15,
-            'energy': 0.10,
+            'responsiveness': 0.30,
+            'energy': 0.25,
             'brightness_global': 0.6,
-            'speed_global': 0.3,
-            'pulse_global': 0.3,
-            'follow_speed_global': 0.5,
-            'exploration': 0.05,
-            'sociability': 0.05,
+            'speed_global': 0.35,
+            'pulse_global': 0.35,
+            'follow_speed_global': 0.6,
+            'exploration': 0.15,
+            'sociability': 0.20,
+            'attention_span': 0.10,
+            'idle_trend_weight': 0.10,
         }
+        
+        # Mean-reversion targets — params drift back toward these when
+        # not being actively pushed. Prevents extremes from being sticky.
+        self.home_values = {
+            'responsiveness': 0.50,
+            'energy': 0.45,
+            'attention_span': 0.50,
+            'sociability': 0.45,
+            'exploration': 0.40,
+            'memory': 0.30,
+            'brightness_global': 1.2,
+            'speed_global': 0.70,
+            'pulse_global': 0.80,
+            'follow_speed_global': 1.0,
+            'dwell_influence': 0.50,
+            'idle_trend_weight': 0.40,
+        }
+        
+        # Curiosity: periodic random perturbation to explore parameter space
+        # Increased strength (0.015→0.04) and frequency (60s→30s) so curiosity
+        # can meaningfully counteract steady delta pressure toward floors
+        self._curiosity_interval = 30.0  # Every 30 seconds (was 60)
+        self._last_curiosity_time = time.time()
+        self._curiosity_strength = 0.04  # Stronger nudge (was 0.015)
+        
+        # Fix 3: Adaptive target — tracks rolling median of short_activity
+        # so the target matches actual traffic instead of a static 0.5
+        self._activity_history: List[float] = []  # Rolling window of short_activity values
+        self._activity_history_max = 500  # ~42 minutes at 5s intervals
+        self._adaptive_target: Optional[float] = None  # None = use config default until enough data
+        self._adaptive_target_min = 0.03  # Don't let target go below this
+        self._adaptive_target_max = 0.40  # Don't let target go above this
+        
+        # Fix 6: Periodic resets toward home values at time-of-day transitions
+        self._last_reset_hour: Optional[int] = None  # Track which reset window we last applied
+        self._reset_hours = {0, 6, 12, 18}  # Reset at midnight, 6am, noon, 6pm
+        self._reset_blend = 0.40  # Blend 40% toward home values on reset
+        
+        # Mean reversion parameters (overridable by meta-tuner)
+        self._reversion_base = 0.02
+        self._reversion_progressive = 0.06
+        
+        # Budget restore time (overridable by meta-tuner)
+        self._budget_restore_seconds = 300.0
+        
+        # Hot-reload: check autotune_overrides.json for meta-tuner config changes
+        self._override_file = AUTOTUNE_OVERRIDES_FILE
+        self._override_mtime: float = 0.0  # Last known mtime of override file
+        self._override_check_interval: float = 30.0  # Check every 30 seconds
+        self._last_override_check: float = 0.0
+        self._load_overrides()  # Load on startup if file exists
         
         # Learned biases from previous days' reports (loaded from DB)
         self.learned_starting_values: Dict[str, float] = {}
         self.learned_caps_adjustments: Dict[str, float] = {}
         self.days_of_learning: int = 0
 
+    def _load_overrides(self):
+        """
+        Load config overrides from autotune_overrides.json (written by meta-tuner).
+        Updates home_values, safe_floors, caps, curiosity, reversion, and budget settings.
+        
+        Safeguards:
+        - All values are clamped to sane ranges (no NaN/inf, no extreme values)
+        - Malformed JSON is caught and the file is renamed with .bad suffix
+        - If the file can't be read, the controller continues with current values
+        - Unknown keys are silently ignored (forward-compatible)
+        """
+        try:
+            if not os.path.exists(self._override_file):
+                return False
+            
+            mtime = os.path.getmtime(self._override_file)
+            if mtime == self._override_mtime:
+                return False  # File hasn't changed
+            
+            with open(self._override_file, 'r') as f:
+                raw = f.read()
+            
+            if not raw.strip():
+                logger.warning("Meta-tuner override file is empty — ignoring")
+                self._override_mtime = mtime
+                return False
+            
+            overrides = json.loads(raw)
+            
+            if not isinstance(overrides, dict):
+                logger.warning(f"Meta-tuner override file root is not a dict ({type(overrides).__name__}) — ignoring")
+                self._override_mtime = mtime
+                return False
+            
+            self._override_mtime = mtime
+            changes = []
+            
+            def _safe_float(v, lo, hi):
+                """Convert to float, reject NaN/inf, clamp to [lo, hi]."""
+                f = float(v)
+                if not math.isfinite(f):
+                    return None  # Reject NaN and inf
+                return max(lo, min(hi, f))
+            
+            # Apply home_values overrides (clamped to [0, 5])
+            if 'home_values' in overrides and isinstance(overrides['home_values'], dict):
+                for name, val in overrides['home_values'].items():
+                    if name in self.home_values:
+                        clamped = _safe_float(val, 0.0, 5.0)
+                        if clamped is None:
+                            logger.warning(f"Override home[{name}]={val} is NaN/inf — skipping")
+                            continue
+                        old = self.home_values[name]
+                        if abs(old - clamped) > 0.001:
+                            self.home_values[name] = clamped
+                            changes.append(f"home[{name}]:{old:.3f}→{clamped:.3f}")
+            
+            # Apply safe_floors overrides (clamped to [0, 2])
+            if 'safe_floors' in overrides and isinstance(overrides['safe_floors'], dict):
+                for name, val in overrides['safe_floors'].items():
+                    if name in self.safe_floors:
+                        clamped = _safe_float(val, 0.0, 2.0)
+                        if clamped is None:
+                            continue
+                        old = self.safe_floors[name]
+                        if abs(old - clamped) > 0.001:
+                            self.safe_floors[name] = clamped
+                            changes.append(f"floor[{name}]:{old:.3f}→{clamped:.3f}")
+            
+            # Apply caps overrides (clamped to [0.1, 10])
+            if 'caps' in overrides and isinstance(overrides['caps'], dict):
+                for name, val in overrides['caps'].items():
+                    if name in self.caps:
+                        clamped = _safe_float(val, 0.1, 10.0)
+                        if clamped is None:
+                            continue
+                        old = self.caps[name]
+                        if abs(old - clamped) > 0.001:
+                            self.caps[name] = clamped
+                            changes.append(f"cap[{name}]:{old:.3f}→{clamped:.3f}")
+            
+            # Apply curiosity overrides (interval [5, 600], strength [0, 0.2])
+            if 'curiosity' in overrides and isinstance(overrides.get('curiosity'), dict):
+                c = overrides['curiosity']
+                if 'interval' in c:
+                    v = _safe_float(c['interval'], 5.0, 600.0)
+                    if v is not None:
+                        self._curiosity_interval = v
+                if 'strength' in c:
+                    v = _safe_float(c['strength'], 0.0, 0.2)
+                    if v is not None:
+                        self._curiosity_strength = v
+            
+            # Apply reversion overrides (base [0, 0.1], progressive [0, 0.3])
+            if 'reversion' in overrides and isinstance(overrides.get('reversion'), dict):
+                r = overrides['reversion']
+                if 'base' in r:
+                    v = _safe_float(r['base'], 0.0, 0.1)
+                    if v is not None:
+                        self._reversion_base = v
+                if 'progressive' in r:
+                    v = _safe_float(r['progressive'], 0.0, 0.3)
+                    if v is not None:
+                        self._reversion_progressive = v
+            
+            # Apply budget overrides (max [5, 100], cost_scale [1, 200], restore_seconds [30, 1200])
+            if 'budget' in overrides and isinstance(overrides.get('budget'), dict):
+                b = overrides['budget']
+                if 'max' in b:
+                    v = _safe_float(b['max'], 5.0, 100.0)
+                    if v is not None:
+                        slider = self.sliders.get('interaction_budget')
+                        if slider is not None:
+                            slider.value = v
+                if 'cost_scale' in b:
+                    v = _safe_float(b['cost_scale'], 1.0, 200.0)
+                    if v is not None:
+                        self.config.budget_cost_scale = v
+                if 'restore_seconds' in b:
+                    v = _safe_float(b['restore_seconds'], 30.0, 1200.0)
+                    if v is not None:
+                        self._budget_restore_seconds = v
+            
+            if changes:
+                logger.info(f"🔄 Loaded {len(changes)} meta-tuner overrides: {', '.join(changes[:5])}{'...' if len(changes) > 5 else ''}")
+            return True
+            
+        except json.JSONDecodeError as e:
+            # Corrupted JSON — rename the bad file so we don't retry every 30s
+            logger.error(f"Corrupted meta-tuner override file: {e}")
+            try:
+                bad_path = self._override_file + '.bad'
+                os.rename(self._override_file, bad_path)
+                logger.warning(f"Renamed corrupted override file to {bad_path}")
+            except OSError:
+                pass
+            self._override_mtime = 0.0  # Reset so we re-check if a new file appears
+            return False
+        except (IOError, OSError, TypeError, ValueError) as e:
+            logger.warning(f"Failed to load autotune overrides: {e}")
+            return False
+        except Exception as e:
+            # Catch-all: never let the override loader crash the controller
+            logger.error(f"Unexpected error loading autotune overrides: {e}")
+            return False
+    
     def set_enabled(self, enabled: bool):
         self.enabled = enabled
     
@@ -1361,7 +1566,7 @@ class AutoTuningManager:
     def _budget_max(self) -> float:
         slider = self.sliders.get('interaction_budget')
         if slider is None:
-            return 60.0
+            return 30.0
         return max(0.0, float(slider.value))
 
     def _apply_values(self, new_values: dict):
@@ -1376,12 +1581,18 @@ class AutoTuningManager:
         return max(min_val, min(max_val, value))
 
     def update(self, behavior_status: dict, now: float) -> Optional[dict]:
+        # --- Periodic hot-reload of meta-tuner overrides ---
+        if now - self._last_override_check > self._override_check_interval:
+            self._last_override_check = now
+            self._load_overrides()
+        
         budget_max = self._budget_max()
         dt_budget = max(0.0, now - self.budget_last_time)
         if dt_budget > 0:
-            restore_rate = budget_max / 120.0 if budget_max > 0 else 0.0
+            # Budget restore rate from instance var (overridable by meta-tuner)
+            restore_rate = budget_max / self._budget_restore_seconds if budget_max > 0 else 0.0
             aggression = behavior_status.get('aggression', {})
-            engagement_bonus = budget_max / 45.0 if aggression.get('current_engagement') else 0.0
+            engagement_bonus = budget_max / 60.0 if aggression.get('current_engagement') else 0.0
             self.budget_current = min(budget_max, self.budget_current + dt_budget * (restore_rate + engagement_bonus))
             self.budget_last_time = now
 
@@ -1410,32 +1621,124 @@ class AutoTuningManager:
         elif aggression_level > 0.6:
             damping = self.config.damping_moderate
 
-        target = self.config.target_activity
-        need_short = max(-0.4, min(0.4, target - short_activity))
-        need_medium = max(-0.4, min(0.4, target - medium_activity))
-        need_long = max(-0.4, min(0.4, target - long_activity))
-        combined_need = 0.5 * need_short + 0.3 * need_medium + 0.2 * need_long
+        # --- FIX 6: PERIODIC TIME-OF-DAY RESETS ---
+        # Every 6 hours (midnight, 6am, noon, 6pm), blend params 40% toward
+        # home values. This breaks floor-clamping cycles even if deltas have issues.
+        current_hour = datetime.now().hour
+        if current_hour in self._reset_hours:
+            if self._last_reset_hour != current_hour:
+                self._last_reset_hour = current_hour
+                current_values = self._get_values()
+                reset_values = {}
+                for name, home_val in self.home_values.items():
+                    cur = current_values.get(name)
+                    if cur is not None:
+                        blended = cur * (1.0 - self._reset_blend) + home_val * self._reset_blend
+                        reset_values[name] = self._clamp(name, blended)
+                self._apply_values(reset_values)
+                logger.info(f"🔄 Time-of-day reset (hour={current_hour}): blended {len(reset_values)} params {self._reset_blend:.0%} toward home")
+        elif self._last_reset_hour is not None and current_hour not in self._reset_hours:
+            # Clear the flag so the next reset hour triggers again
+            if self._last_reset_hour in self._reset_hours and current_hour != self._last_reset_hour:
+                self._last_reset_hour = None
 
-        deltas = {
-            'responsiveness': combined_need * 0.08 * damping,
-            'sociability': combined_need * 0.07 * damping,
-            'follow_speed_global': combined_need * 0.12 * damping,
-            'energy': combined_need * 0.06 * damping,
-            'brightness_global': need_long * 0.10 * damping,
-            'speed_global': need_short * 0.07 * damping,
-            'pulse_global': need_short * 0.06 * damping,
-        }
+        # --- FIX 3: ADAPTIVE TARGET ---
+        # Track rolling history of short_activity and use its median as the target,
+        # so deltas are relative to actual traffic rather than a static 0.5
+        self._activity_history.append(short_activity)
+        if len(self._activity_history) > self._activity_history_max:
+            self._activity_history = self._activity_history[-self._activity_history_max:]
+        
+        if len(self._activity_history) >= 20:  # Need ~100s of data before adapting
+            sorted_history = sorted(self._activity_history)
+            median_activity = sorted_history[len(sorted_history) // 2]
+            self._adaptive_target = max(self._adaptive_target_min, 
+                                        min(self._adaptive_target_max, median_activity))
+            target = self._adaptive_target
+        else:
+            target = self.config.target_activity  # Fallback to static 0.5 until enough data
 
-        if medium_activity < 0.4:
-            deltas['exploration'] = (0.4 - medium_activity) * 0.10 * damping
-            deltas['attention_span'] = (0.4 - medium_activity) * 0.08 * damping
-        elif medium_activity > 0.75:
-            deltas['exploration'] = -(medium_activity - 0.75) * 0.08 * damping
-            deltas['attention_span'] = (medium_activity - 0.75) * 0.04 * damping
+        activity_excess = max(-0.5, min(0.5, short_activity - target))  # positive when busy
+        medium_excess = max(-0.5, min(0.5, medium_activity - target))
 
-        deltas['memory'] = (long_activity - 0.5) * 0.04 * damping
-        deltas['dwell_influence'] = (energy_level - 0.5) * 0.04 * damping
-        deltas['idle_trend_weight'] = (0.5 - short_activity) * 0.04 * damping
+        # --- FIX 4: DECOUPLE BRIGHTNESS FROM EMPTY LONG-TERM DATA ---
+        # Only use long_activity deficit if we have meaningful long-term data.
+        # When long_activity is 0 (fresh DB / no history), fall back to medium_activity
+        # to avoid a constant upward push on brightness.
+        effective_long = long_activity
+        if long_activity <= 0.001 and medium_activity > 0.001:
+            effective_long = medium_activity  # Use medium as proxy until long-term fills in
+        long_deficit = max(-0.3, min(0.3, target - effective_long))  # positive when quiet
+
+        deltas = {}
+
+        # --- FIX 1: ASYMMETRIC PERSONALITY DELTAS ---
+        # Only push personality UP when activity is above target (busy).
+        # When quiet (activity_excess < 0), do NOT actively suppress personality —
+        # let mean reversion handle the gentle drift back toward home.
+        # This prevents personality from being perpetually driven to the floor
+        # on a normally-quiet sidewalk.
+        if activity_excess > 0:
+            # Busy: increase responsiveness, sociability, energy to match the crowd
+            deltas['responsiveness'] = activity_excess * 0.04 * damping
+            deltas['sociability'] = activity_excess * 0.04 * damping
+            deltas['energy'] = activity_excess * 0.03 * damping
+            deltas['follow_speed_global'] = activity_excess * 0.05 * damping
+        # else: personality deltas are 0; mean reversion handles quiet-period drift
+
+        # DISPLAY PARAMS: inversely adjust to activity
+        # When quiet: brighter, more pulsing, more speed (attract attention)
+        # When busy: moderate down (don't be overwhelming)
+        deltas['brightness_global'] = -activity_excess * 0.04 * damping + long_deficit * 0.06 * damping
+        deltas['speed_global'] = -activity_excess * 0.03 * damping + long_deficit * 0.04 * damping
+        deltas['pulse_global'] = -activity_excess * 0.03 * damping + long_deficit * 0.04 * damping
+
+        # EXPLORATION: increase when things are quiet (search for people)
+        # decrease when busy (focus on the crowd)
+        if medium_activity < 0.3:
+            deltas['exploration'] = (0.3 - medium_activity) * 0.06 * damping
+        elif medium_activity > 0.6:
+            deltas['exploration'] = -(medium_activity - 0.6) * 0.04 * damping
+
+        # ATTENTION SPAN: longer when quiet (contemplate), shorter when busy (reactive)
+        deltas['attention_span'] = -activity_excess * 0.03 * damping
+
+        deltas['memory'] = (effective_long - 0.5) * 0.03 * damping
+        deltas['dwell_influence'] = (energy_level - 0.5) * 0.03 * damping
+        deltas['idle_trend_weight'] = (0.5 - short_activity) * 0.03 * damping
+
+        # --- FIX 2: STRONGER PROGRESSIVE MEAN REVERSION ---
+        # Base strength and progressive component are overridable by meta-tuner
+        current_values = self._get_values()
+        reversion_base = self._reversion_base
+        reversion_progressive = self._reversion_progressive
+        for name, home_val in self.home_values.items():
+            current_val = current_values.get(name)
+            if current_val is not None:
+                distance_from_home = home_val - current_val
+                # Progressive: stronger pull when further from home
+                strength = reversion_base + reversion_progressive * abs(distance_from_home)
+                pull = distance_from_home * strength
+                deltas[name] = deltas.get(name, 0.0) + pull
+
+        # --- FIX 5: STRONGER CURIOSITY BIASED TOWARD HOME ---
+        # Increased strength (0.015→0.04) and frequency (60s→30s).
+        # Also biased: 60% of the nudge is toward home, 40% is random.
+        # This helps exploration while gently countering floor-clamping.
+        if now - self._last_curiosity_time > self._curiosity_interval:
+            self._last_curiosity_time = now
+            for name in self.param_order:
+                # Random component
+                random_nudge = (random.random() - 0.5) * 2.0 * self._curiosity_strength
+                # Bias toward home: if below home, bias nudge positive (and vice versa)
+                home_val = self.home_values.get(name)
+                current_val = current_values.get(name)
+                if home_val is not None and current_val is not None:
+                    home_direction = 1.0 if home_val > current_val else -1.0
+                    biased_nudge = 0.4 * random_nudge + 0.6 * abs(random_nudge) * home_direction
+                else:
+                    biased_nudge = random_nudge
+                deltas[name] = deltas.get(name, 0.0) + biased_nudge
 
         old_values = self._get_values()
         new_values = dict(old_values)
@@ -2286,6 +2589,95 @@ def draw_auto_tuning_panel(x: int, y: int, width: int, height: int, font, font_s
                     break
             if delta_y < y + 10:
                 break
+
+
+def _build_behavior_description(behavior, active_count: int, passive_count: int) -> str:
+    """
+    Build a concise human-readable description of the light's current behavior
+    for the public viewer subheading.
+    
+    Returns a short phrase like:
+    - "Wandering · Scanning"
+    - "Engaged · Following"  
+    - "Engaged · Breathing Together"
+    - "Engaged · Nodding"
+    - "Idle · Acknowledging Passerby"
+    - "Crowd · Orbiting"
+    """
+    if not behavior:
+        return ""
+    
+    mode = behavior.state.mode
+    gesture = behavior.state.gesture
+    is_bored = behavior.state.is_bored
+    dwell_bonus = behavior.state.current_dwell_bonus
+    breathing = behavior.state.engaged_breathe_active
+    breathe_depth = behavior.state.engaged_breathe_depth
+    mode_duration = behavior.state.mode_duration
+    
+    # Gesture descriptions (takes priority when active)
+    gesture_descriptions = {
+        GestureType.WELCOME: "Welcoming",
+        GestureType.SURPRISED: "Surprised",
+        GestureType.CURIOUS: "Approaching",
+        GestureType.ACKNOWLEDGE: "Acknowledging Passerby",
+        GestureType.FAREWELL: "Saying Goodbye",
+        GestureType.NOD: "Nodding",
+        GestureType.LEAN: "Leaning In",
+        GestureType.SWAY: "Swaying",
+        GestureType.ORBIT: "Orbiting",
+        GestureType.SETTLE: "Settling In",
+        GestureType.BREATHE: "Breathing",
+        GestureType.BLOOM: "Blooming",
+        GestureType.BORED: "Restless",
+        GestureType.THINKING: "Thinking",
+        GestureType.HESITANT: "Hesitant",
+        GestureType.PLAYFUL: "Playing",
+    }
+    
+    # Mode labels
+    mode_labels = {
+        BehaviorMode.IDLE: "Idle",
+        BehaviorMode.ENGAGED: "Engaged",
+        BehaviorMode.CROWD: "Crowd",
+        BehaviorMode.FLOW: "Flow",
+    }
+    
+    mode_label = mode_labels.get(mode, "")
+    
+    # Active gesture takes priority for the action description
+    if gesture != GestureType.NONE and gesture in gesture_descriptions:
+        action = gesture_descriptions[gesture]
+        return f"{mode_label} · {action}"
+    
+    # No gesture — describe based on mode and state
+    if mode == BehaviorMode.IDLE:
+        if is_bored:
+            return "Idle · Waiting"
+        elif passive_count > 0:
+            return "Idle · Watching"
+        else:
+            return "Idle · Wandering"
+    
+    elif mode in (BehaviorMode.ENGAGED, BehaviorMode.CROWD):
+        # Describe engagement depth
+        if breathing and breathe_depth > 0.5:
+            return f"{mode_label} · Breathing Together"
+        elif dwell_bonus > 10:
+            return f"{mode_label} · Deep Connection"
+        elif dwell_bonus > 5:
+            return f"{mode_label} · Bonding"
+        elif mode_duration > 10:
+            return f"{mode_label} · Following"
+        elif mode_duration > 3:
+            return f"{mode_label} · Greeting"
+        else:
+            return f"{mode_label} · Noticing"
+    
+    elif mode == BehaviorMode.FLOW:
+        return "Flow · Drifting with Traffic"
+    
+    return mode_label
 
 
 def draw_realtime_trends(idle_trends: dict, x: int, y: int, font, font_small, aggression: dict = None, flow: dict = None, almost_engaged: dict = None, feedback_learning: dict = None):
@@ -3441,19 +3833,24 @@ def main():
     # Tracked person manager
     tracked_manager = TrackedPersonManager()
     
-    # Find available database files
+    # Find available database files (always in script's directory)
     import glob
-    db_files = sorted(glob.glob("*.db") + glob.glob("tracking_*.db"))
+    db_pattern_dir = SCRIPT_DIR
+    db_files = sorted(
+        os.path.basename(f) for f in 
+        glob.glob(os.path.join(db_pattern_dir, "*.db")) + glob.glob(os.path.join(db_pattern_dir, "tracking_*.db"))
+    )
+    db_files = list(dict.fromkeys(db_files))  # deduplicate preserving order
     if "tracking_history.db" not in db_files:
         db_files.insert(0, "tracking_history.db")
     else:
         # Move tracking_history.db to front
         db_files.remove("tracking_history.db")
         db_files.insert(0, "tracking_history.db")
-    current_db_file = "tracking_history.db"
+    current_db_file = os.path.join(SCRIPT_DIR, "tracking_history.db")
     current_db_index = 0
     
-    # Tracking database
+    # Tracking database (absolute path so it works from any cwd)
     tracking_db = TrackingDatabase(current_db_file)
     print(f"💾 Tracking database: {current_db_file}")
     
@@ -3864,7 +4261,7 @@ def main():
                     # Cycle through available database files
                     if len(db_files) > 1:
                         current_db_index = (current_db_index + 1) % len(db_files)
-                        new_db_file = db_files[current_db_index]
+                        new_db_file = os.path.join(SCRIPT_DIR, db_files[current_db_index])
                         # Close old database and open new one
                         tracking_db.close()
                         tracking_db = TrackingDatabase(new_db_file)
@@ -4131,12 +4528,32 @@ def main():
                     'mode': behavior.state.mode.name if behavior else 'UNKNOWN',
                     'gesture': behavior.state.gesture.name if behavior and behavior.state.gesture else None,
                     'status': status_text,
+                    'behavior_description': _build_behavior_description(behavior, active_count, passive_count) if behavior else '',
+                    'dwell_phase': behavior_status.get('driving_factors', {}).get('dwell_time', 0) if behavior_status else 0,
+                    'engaged_breathing': behavior_status.get('engaged_breathing', {}) if behavior_status else {},
                     'realtime_trends': realtime_trends,
                     'auto_tuning': {
                         'enabled': auto_tuner.enabled,
                         'revision': auto_tuner.revision,
-                        'last_adjustment': auto_tuner.last_adjustment,
                         'params': {name: round(float(getattr(meta_params, name)), 3) for name in auto_tuner.param_order},
+                        # Compact summary instead of full last_adjustment blob
+                        'activity': {
+                            'short': round(auto_tuner.last_adjustment.get('short_activity', 0), 3) if auto_tuner.last_adjustment else 0,
+                            'medium': round(auto_tuner.last_adjustment.get('medium_activity', 0), 3) if auto_tuner.last_adjustment else 0,
+                            'long': round(auto_tuner.last_adjustment.get('long_activity', 0), 3) if auto_tuner.last_adjustment else 0,
+                            'energy': round(auto_tuner.last_adjustment.get('energy_level', 0), 3) if auto_tuner.last_adjustment else 0,
+                        } if auto_tuner.last_adjustment else None,
+                        'budget': {
+                            'current': round(auto_tuner.budget_current, 1),
+                            'max': round(auto_tuner._budget_max(), 1),
+                        },
+                        'top_deltas': [
+                            {'name': n, 'delta': round(d, 4)}
+                            for n, d in sorted(
+                                (auto_tuner.last_adjustment.get('applied_deltas', {}) if auto_tuner.last_adjustment else {}).items(),
+                                key=lambda kv: abs(kv[1]), reverse=True
+                            )[:4]
+                        ] if auto_tuner.last_adjustment else [],
                     },
                     'population': {
                         'current': len(tracked_manager.get_all()),

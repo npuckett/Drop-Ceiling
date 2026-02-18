@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-Pedestrian Simulator for Light Installation Testing (Headless)
+Pedestrian Simulator for Light Installation Testing - V2 (Headless)
 
 Simulates pedestrian traffic on a busy Toronto sidewalk.
-Runs in terminal without a window - view results in lightController.
+Runs in terminal without a window - view results in lightController_v2.py.
+
+V2 Improvements:
+  - Uses V2 coordinate system (origin at back right of Panel 0, X negative leftward)
+  - Loads tracking zones from world_coordinates.json
+  - Sends zone messages matching camera_tracker_osc_v2.py
 
 Pedestrian Types:
 1. PASSIVE - Walk straight through the passive zone (sidewalk traffic)
@@ -11,9 +16,10 @@ Pedestrian Types:
 3. CURIOUS - Start in passive zone, notice installation, enter active zone,
               explore for a while, then exit back through passive zone
 
-Sends OSC messages in the same format as the camera tracker:
+OSC Messages Sent (matching camera_tracker_osc_v2.py):
   /tracker/person/<id> <x> <z>  - Position of tracked person (cm)
   /tracker/count <n>            - Number of people currently tracked
+  /tracker/zone/<id> <zone>     - Zone of each person ('active', 'passive', or 'outside')
 
 Controls (keyboard in terminal):
   +/-   : Adjust passive pedestrian spawn rate
@@ -27,15 +33,24 @@ All units in centimeters.
 """
 
 import sys
+import os
+import json
 import math
 import time
 import random
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from enum import Enum, auto
 
 # OSC client
 from pythonosc import udp_client
+
+# =============================================================================
+# FILE PATHS
+# =============================================================================
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+WORLD_COORDS_FILE = os.path.join(_SCRIPT_DIR, 'world_coordinates.json')
 
 # =============================================================================
 # CONFIGURATION (all units in centimeters)
@@ -48,21 +63,28 @@ OSC_TARGET_PORT = 7000
 # Simulation settings
 FPS = 30
 
-# Zone definitions (matching lightController)
+# Default zone definitions (will be overridden by world_coordinates.json)
+# V2 coordinate system: origin at back right corner of Panel 0
+# X is negative toward left, Z is positive toward camera/sidewalk
+
 # Active zone - between columns, where engaged people are
+# X: -280 to -20 (covering all 4 panels)
+# Z: 78 to 283 (from camera ledge to back of active area)
 ACTIVE_ZONE = {
-    'width': 475,
-    'depth': 205,
-    'offset_z': 78,
-    'center_x': 120,
+    'min_x': -280,
+    'max_x': -20,
+    'min_z': 78,
+    'max_z': 283,
 }
 
 # Passive zone - sidewalk traffic passing by
+# X: -350 to 50 (wider than active)
+# Z: 283 to 553 (starts where active ends, extends toward street)
 PASSIVE_ZONE = {
-    'width': 650,
-    'depth': 330,
-    'offset_z': 78 + 205,  # Starts at back of active zone (283cm)
-    'center_x': 120,
+    'min_x': -350,
+    'max_x': 50,
+    'min_z': 283,
+    'max_z': 553,
 }
 
 # Pedestrian settings
@@ -76,9 +98,9 @@ PASSIVE_SPAWN_RATE = 30     # Busy sidewalk
 ACTIVE_SPAWN_RATE = 0.5     # Rare - someone actually enters
 CURIOUS_SPAWN_RATE = 2.0    # Occasionally someone gets curious
 
-# Walking directions
-DIRECTION_LEFT_TO_RIGHT = 1
-DIRECTION_RIGHT_TO_LEFT = -1
+# Walking directions (in V2: positive X is right, negative X is left)
+DIRECTION_LEFT = -1   # Toward more negative X
+DIRECTION_RIGHT = 1   # Toward more positive X
 
 
 # =============================================================================
@@ -129,6 +151,81 @@ GAP_SETTINGS = {
 
 
 # =============================================================================
+# WORLD COORDINATES LOADER
+# =============================================================================
+
+def load_world_coordinates() -> Dict[str, Any]:
+    """Load tracking zones from world_coordinates.json"""
+    global ACTIVE_ZONE, PASSIVE_ZONE
+    
+    try:
+        with open(WORLD_COORDS_FILE, 'r') as f:
+            data = json.load(f)
+        
+        zones = data.get('tracking_zones', {})
+        
+        # Load active zone
+        if 'active' in zones:
+            bounds = zones['active'].get('bounds', {})
+            if 'x' in bounds and 'z' in bounds:
+                ACTIVE_ZONE = {
+                    'min_x': bounds['x'][0],
+                    'max_x': bounds['x'][1],
+                    'min_z': bounds['z'][0],
+                    'max_z': bounds['z'][1],
+                }
+        
+        # Load passive zone
+        if 'passive' in zones:
+            bounds = zones['passive'].get('bounds', {})
+            if 'x' in bounds and 'z' in bounds:
+                PASSIVE_ZONE = {
+                    'min_x': bounds['x'][0],
+                    'max_x': bounds['x'][1],
+                    'min_z': bounds['z'][0],
+                    'max_z': bounds['z'][1],
+                }
+        
+        print(f"📐 Loaded zones from {WORLD_COORDS_FILE}")
+        print(f"   Active zone: X[{ACTIVE_ZONE['min_x']}, {ACTIVE_ZONE['max_x']}] Z[{ACTIVE_ZONE['min_z']}, {ACTIVE_ZONE['max_z']}]")
+        print(f"   Passive zone: X[{PASSIVE_ZONE['min_x']}, {PASSIVE_ZONE['max_x']}] Z[{PASSIVE_ZONE['min_z']}, {PASSIVE_ZONE['max_z']}]")
+        
+        return data
+        
+    except FileNotFoundError:
+        print(f"⚠️ world_coordinates.json not found, using defaults")
+        return {}
+    except Exception as e:
+        print(f"⚠️ Error loading world_coordinates.json: {e}")
+        return {}
+
+
+# =============================================================================
+# ZONE CHECKER
+# =============================================================================
+
+class ZoneChecker:
+    """Determines which zone a position is in"""
+    
+    def check(self, x: float, z: float) -> str:
+        """
+        Check which zone the position is in.
+        Returns 'active', 'passive', or 'outside'
+        """
+        # Check active zone first (has priority)
+        if (ACTIVE_ZONE['min_x'] <= x <= ACTIVE_ZONE['max_x'] and
+            ACTIVE_ZONE['min_z'] <= z <= ACTIVE_ZONE['max_z']):
+            return 'active'
+        
+        # Check passive zone
+        if (PASSIVE_ZONE['min_x'] <= x <= PASSIVE_ZONE['max_x'] and
+            PASSIVE_ZONE['min_z'] <= z <= PASSIVE_ZONE['max_z']):
+            return 'passive'
+        
+        return 'outside'
+
+
+# =============================================================================
 # PEDESTRIAN STATES
 # =============================================================================
 
@@ -153,7 +250,7 @@ class SimulatedPerson:
     x: float
     z: float
     speed: float
-    direction: int  # 1 = left-to-right, -1 = right-to-left
+    direction: int  # 1 = toward positive X (right), -1 = toward negative X (left)
     state: PedestrianState = PedestrianState.PASSIVE_WALKING
     
     # Target for wandering/moving
@@ -187,23 +284,19 @@ class SimulatedPerson:
         return True
     
     def _update_passive_walking(self, dt: float) -> bool:
-        """Walk straight through passive zone"""
+        """Walk straight through passive zone (parallel to panels, along X axis)"""
         self.x += self.direction * self.speed * dt
         
         # Add slight z wandering
         self.z += random.uniform(-5, 5) * dt
         
         # Clamp z to passive zone
-        pz = PASSIVE_ZONE
-        min_z = pz['offset_z']
-        max_z = pz['offset_z'] + pz['depth']
-        self.z = max(min_z + 20, min(max_z - 20, self.z))
+        min_z = PASSIVE_ZONE['min_z'] + 20
+        max_z = PASSIVE_ZONE['max_z'] - 20
+        self.z = max(min_z, min(max_z, self.z))
         
-        # Check if exited
-        pz_min_x = pz['center_x'] - pz['width'] / 2 - 50
-        pz_max_x = pz['center_x'] + pz['width'] / 2 + 50
-        
-        if self.x < pz_min_x or self.x > pz_max_x:
+        # Check if exited (left or right side of passive zone)
+        if self.x < PASSIVE_ZONE['min_x'] - 50 or self.x > PASSIVE_ZONE['max_x'] + 50:
             return False  # Remove
         
         return True
@@ -212,12 +305,11 @@ class SimulatedPerson:
         """Moving from passive zone into active zone"""
         if self.target_x is None:
             # Pick entry point in active zone
-            az = ACTIVE_ZONE
-            self.target_x = random.uniform(
-                az['center_x'] - az['width']/3,
-                az['center_x'] + az['width']/3
-            )
-            self.target_z = az['offset_z'] + az['depth'] - 30  # Near back of active zone
+            # Target is within active zone, centered on X
+            center_x = (ACTIVE_ZONE['min_x'] + ACTIVE_ZONE['max_x']) / 2
+            self.target_x = random.uniform(center_x - 80, center_x + 80)
+            # Target near back of active zone (higher Z values are farther from panels)
+            self.target_z = ACTIVE_ZONE['max_z'] - 30
         
         # Move toward target
         if self._move_toward_target(dt, speed_mult=0.7):
@@ -259,9 +351,8 @@ class SimulatedPerson:
         """Leaving active zone, heading back to passive"""
         if self.target_x is None:
             # Pick exit point at edge of active/passive boundary
-            az = ACTIVE_ZONE
             self.target_x = self.x + self.direction * 50  # Move in original direction
-            self.target_z = az['offset_z'] + az['depth'] + 30  # Just into passive zone
+            self.target_z = ACTIVE_ZONE['max_z'] + 30  # Just into passive zone
         
         # Move toward exit
         if self._move_toward_target(dt, speed_mult=0.8):
@@ -279,11 +370,7 @@ class SimulatedPerson:
         self.x += self.direction * self.speed * dt
         
         # Check if exited
-        pz = PASSIVE_ZONE
-        pz_min_x = pz['center_x'] - pz['width'] / 2 - 50
-        pz_max_x = pz['center_x'] + pz['width'] / 2 + 50
-        
-        if self.x < pz_min_x or self.x > pz_max_x:
+        if self.x < PASSIVE_ZONE['min_x'] - 50 or self.x > PASSIVE_ZONE['max_x'] + 50:
             return False  # Remove
         
         return True
@@ -309,14 +396,14 @@ class SimulatedPerson:
     
     def _pick_active_target(self):
         """Pick a new wander target in active zone"""
-        az = ACTIVE_ZONE
+        margin = 50
         self.target_x = random.uniform(
-            az['center_x'] - az['width']/2 + 50,
-            az['center_x'] + az['width']/2 - 50
+            ACTIVE_ZONE['min_x'] + margin,
+            ACTIVE_ZONE['max_x'] - margin
         )
         self.target_z = random.uniform(
-            az['offset_z'] + 30,
-            az['offset_z'] + az['depth'] - 30
+            ACTIVE_ZONE['min_z'] + 30,
+            ACTIVE_ZONE['max_z'] - 30
         )
         self.max_dwell = random.uniform(1, 5)
 
@@ -332,6 +419,7 @@ class PedestrianSimulator:
         self.people: List[SimulatedPerson] = []
         self.next_id = 1
         self.mode = mode
+        self.zone_checker = ZoneChecker()
         
         # Spawn timing
         self.passive_spawn_timer = 0.0
@@ -363,19 +451,20 @@ class PedestrianSimulator:
     
     def spawn_passive_person(self):
         """Spawn a person walking through passive zone"""
-        pz = PASSIVE_ZONE
-        
         # Random direction
-        direction = random.choice([DIRECTION_LEFT_TO_RIGHT, DIRECTION_RIGHT_TO_LEFT])
+        direction = random.choice([DIRECTION_LEFT, DIRECTION_RIGHT])
         
-        # Start position
-        if direction == DIRECTION_LEFT_TO_RIGHT:
-            x = pz['center_x'] - pz['width']/2 - 30
+        # Start position at edge of passive zone
+        # Walking along X axis (parallel to panels)
+        if direction == DIRECTION_RIGHT:
+            # Start at left (more negative X), walk toward right
+            x = PASSIVE_ZONE['min_x'] - 30
         else:
-            x = pz['center_x'] + pz['width']/2 + 30
+            # Start at right (more positive X), walk toward left
+            x = PASSIVE_ZONE['max_x'] + 30
         
-        # Random z within passive zone
-        z = random.uniform(pz['offset_z'] + 30, pz['offset_z'] + pz['depth'] - 30)
+        # Random z within passive zone (depth from panels)
+        z = random.uniform(PASSIVE_ZONE['min_z'] + 30, PASSIVE_ZONE['max_z'] - 30)
         
         # Random speed
         speed = random.uniform(PEDESTRIAN_SPEED_MIN, PEDESTRIAN_SPEED_MAX)
@@ -393,19 +482,28 @@ class PedestrianSimulator:
         self.total_spawned += 1
     
     def spawn_active_person(self):
-        """Spawn a person directly in active zone"""
-        az = ACTIVE_ZONE
+        """Spawn a person in passive zone who will walk directly into active zone
         
-        x = random.uniform(az['center_x'] - az['width']/3, az['center_x'] + az['width']/3)
-        z = random.uniform(az['offset_z'] + 50, az['offset_z'] + az['depth'] - 50)
+        These people spawn at the boundary between passive and active zones
+        and walk straight into the active zone (as if they intended to enter).
+        """
+        # Spawn at the boundary between passive and active zone
+        # Random X position within the zone overlap
+        x = random.uniform(
+            max(ACTIVE_ZONE['min_x'], PASSIVE_ZONE['min_x']) + 20,
+            min(ACTIVE_ZONE['max_x'], PASSIVE_ZONE['max_x']) - 20
+        )
+        
+        # Start just inside passive zone, near active zone boundary
+        z = PASSIVE_ZONE['min_z'] + random.uniform(10, 40)
         
         person = SimulatedPerson(
             id=self.next_id,
             x=x,
             z=z,
-            speed=random.uniform(ACTIVE_SPEED_MIN, ACTIVE_SPEED_MAX),
-            direction=random.choice([1, -1]),
-            state=PedestrianState.ACTIVE_WANDERING,
+            speed=random.uniform(PEDESTRIAN_SPEED_MIN * 0.7, PEDESTRIAN_SPEED_MAX * 0.7),  # Walking purposefully but not rushing
+            direction=random.choice([DIRECTION_LEFT, DIRECTION_RIGHT]),
+            state=PedestrianState.ENTERING_ACTIVE,  # Will head to active zone
             max_wander_targets=random.randint(2, 5)
         )
         self.next_id += 1
@@ -416,20 +514,17 @@ class PedestrianSimulator:
     
     def spawn_curious_person(self):
         """Spawn a person who starts in passive zone, enters active, explores, then leaves"""
-        pz = PASSIVE_ZONE
-        az = ACTIVE_ZONE
-        
         # Random direction
-        direction = random.choice([DIRECTION_LEFT_TO_RIGHT, DIRECTION_RIGHT_TO_LEFT])
+        direction = random.choice([DIRECTION_LEFT, DIRECTION_RIGHT])
         
         # Start at edge of passive zone
-        if direction == DIRECTION_LEFT_TO_RIGHT:
-            x = pz['center_x'] - pz['width']/2 - 30
+        if direction == DIRECTION_RIGHT:
+            x = PASSIVE_ZONE['min_x'] - 30
         else:
-            x = pz['center_x'] + pz['width']/2 + 30
+            x = PASSIVE_ZONE['max_x'] + 30
         
-        # Start in passive zone but close to active
-        z = random.uniform(pz['offset_z'] + 20, pz['offset_z'] + 80)
+        # Start in passive zone but close to active zone boundary
+        z = random.uniform(PASSIVE_ZONE['min_z'] + 20, PASSIVE_ZONE['min_z'] + 80)
         
         person = SimulatedPerson(
             id=self.next_id,
@@ -445,6 +540,10 @@ class PedestrianSimulator:
         self.total_spawned += 1
         self.total_curious += 1
         return person.id
+    
+    def get_zone(self, person: SimulatedPerson) -> str:
+        """Get the zone a person is currently in"""
+        return self.zone_checker.check(person.x, person.z)
     
     def update(self, dt: float):
         """Update all pedestrians and handle spawning"""
@@ -494,12 +593,19 @@ class PedestrianSimulator:
         active = sum(1 for p in self.people if p.state == PedestrianState.ACTIVE_WANDERING)
         exiting = sum(1 for p in self.people if p.state in (
             PedestrianState.EXITING_ACTIVE, PedestrianState.EXITING_PASSIVE))
+        
+        # Count by zone
+        active_zone_count = sum(1 for p in self.people if self.get_zone(p) == 'active')
+        passive_zone_count = sum(1 for p in self.people if self.get_zone(p) == 'passive')
+        
         return {
             'passive': passive,
             'entering': entering,
             'active': active,
             'exiting': exiting,
             'total': len(self.people),
+            'active_zone': active_zone_count,
+            'passive_zone': passive_zone_count,
             'in_gap': self.in_gap,
             'in_lull': self.in_lull,
             'pattern': self.current_pattern_desc,
@@ -568,38 +674,52 @@ class PedestrianSimulator:
 
 
 # =============================================================================
-# OSC SENDER
+# OSC SENDER - V2 (matches camera_tracker_osc_v2.py)
 # =============================================================================
 
 class OSCSender:
-    """Sends tracking data via OSC"""
+    """Sends tracking data via OSC - V2 format with zone messages"""
     
-    def __init__(self, ip: str, port: int):
+    def __init__(self, ip: str, port: int, zone_checker: ZoneChecker):
         self.client = udp_client.SimpleUDPClient(ip, port)
+        self.zone_checker = zone_checker
         self.last_count = 0
         self.message_count = 0
         self.last_debug_time = time.time()
         print(f"📤 OSC sender initialized: sending to {ip}:{port}")
     
     def send_people(self, people: List[SimulatedPerson]):
-        """Send all person positions"""
+        """Send all person positions and zones"""
+        # Send count first (like camera_tracker_osc_v2.py)
+        count = len(people)
+        self.client.send_message("/tracker/count", count)
+        
+        # Send each person's position and zone
         for person in people:
+            # Position message
             self.client.send_message(
                 f"/tracker/person/{person.id}",
                 [float(person.x), float(person.z)]
             )
+            
+            # Zone message (V2 addition)
+            zone = self.zone_checker.check(person.x, person.z)
+            self.client.send_message(
+                f"/tracker/zone/{person.id}",
+                zone
+            )
+            
             self.message_count += 1
-        
-        # Send count
-        count = len(people)
-        if count != self.last_count:
-            self.client.send_message("/tracker/count", [count])
-            self.last_count = count
         
         # Debug output every 5 seconds
         now = time.time()
         if now - self.last_debug_time > 5.0 and self.message_count > 0:
-            print(f"  📤 Sent {self.message_count} OSC messages ({count} people)")
+            zone_counts = {'active': 0, 'passive': 0}
+            for person in people:
+                zone = self.zone_checker.check(person.x, person.z)
+                if zone in zone_counts:
+                    zone_counts[zone] += 1
+            print(f"  📤 {count} people (active:{zone_counts['active']}, passive:{zone_counts['passive']})")
             self.last_debug_time = now
             self.message_count = 0
 
@@ -611,7 +731,7 @@ class OSCSender:
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description='Pedestrian Simulator for Light Installation')
+    parser = argparse.ArgumentParser(description='Pedestrian Simulator V2 for Light Installation')
     parser.add_argument('--mode', choices=['normal', 'longrun'], default='normal',
                         help='Simulation mode: normal (constant traffic) or longrun (realistic patterns)')
     parser.add_argument('--timescale', type=float, default=1.0,
@@ -626,9 +746,13 @@ def main():
     mode = SimulationMode.LONG_RUN if args.mode == 'longrun' else SimulationMode.NORMAL
     
     print("=" * 60)
-    print("  PEDESTRIAN SIMULATOR (Headless)")
-    print("  View results in lightController_osc.py")
+    print("  PEDESTRIAN SIMULATOR V2 (Headless)")
+    print("  View results in lightController_v2.py")
     print("=" * 60)
+    print()
+    
+    # Load world coordinates (updates zone definitions)
+    load_world_coordinates()
     print()
     
     if mode == SimulationMode.LONG_RUN:
@@ -660,7 +784,7 @@ def main():
         simulator.set_time_scale(args.timescale)
         simulator.simulated_hours = args.hours
     
-    osc_sender = OSCSender(OSC_TARGET_IP, OSC_TARGET_PORT)
+    osc_sender = OSCSender(OSC_TARGET_IP, OSC_TARGET_PORT, simulator.zone_checker)
     
     print(f"Starting simulation at {FPS} FPS...")
     print()
@@ -706,14 +830,15 @@ def main():
                     
                     print(f"  Day {sim_day} {sim_hour:05.2f}h ({stats['pattern']}){gap_status} | "
                           f"Total: {stats['total']} | "
-                          f"Active: {stats['active']} | "
+                          f"Active zone: {stats['active_zone']} | "
+                          f"Passive zone: {stats['passive_zone']} | "
                           f"Spawned: {stats['total_spawned']}")
                 else:
                     print(f"  Total: {stats['total']} | "
-                          f"Passive: {stats['passive']} | "
-                          f"Entering: {stats['entering']} | "
-                          f"Active: {stats['active']} | "
-                          f"Exiting: {stats['exiting']}")
+                          f"Active zone: {stats['active_zone']} | "
+                          f"Passive zone: {stats['passive_zone']} | "
+                          f"Walking: {stats['passive']} | "
+                          f"Wandering: {stats['active']}")
                 
                 last_status_time = now
             
