@@ -90,6 +90,77 @@ The result is that the light appears to have a physical presence — it's bright
 
 ---
 
+## Inside the Light Controller
+
+The light controller (`lightController_osc.py`) is one Python process that juggles several jobs at once. It splits the work between a **main loop** that runs 30 times per second and three **background threads** that handle slower tasks without interrupting the animation.
+
+```mermaid
+flowchart TB
+    subgraph MAIN["Main Thread — pygame / OpenGL loop @ 30 FPS"]
+        direction TB
+        OSC["Receive OSC\n(non-blocking poll)"]
+        BEHAVIOR["Behavior System\nmode, gestures, personality"]
+        LIGHT["Point Light Math\nposition, pulse, falloff"]
+        PANELS["Panel Brightness\ndistance → 12 DMX values"]
+        RENDER["3D Visualization\nOpenGL + GUI sliders"]
+        ARTNET["Art-Net Output\nDMX over UDP"]
+        DBWRITE["DB Writes\npositions, light state"]
+        DBREAD["DB Reads (periodic)\nstats, trends, pruning"]
+
+        OSC --> BEHAVIOR --> LIGHT --> PANELS --> ARTNET
+        LIGHT --> RENDER
+        OSC --> DBWRITE
+        BEHAVIOR --> DBREAD
+    end
+
+    subgraph WS_THREAD["Background Thread — WebSocket Server"]
+        direction TB
+        WSLOOP["asyncio event loop\nlistens on port 8765"]
+        CLIENTS["Manage connections\n(up to 200 clients)"]
+        BROADCAST["Broadcast state JSON\n@ ~15 FPS"]
+        WSLOOP --> CLIENTS --> BROADCAST
+    end
+
+    subgraph REPORT_THREAD["Background Thread — Daily Report Scheduler"]
+        direction TB
+        CLOCK["Sleep / check clock\nevery 30 seconds"]
+        GEN["Generate report\nat 12:01 AM"]
+        PERSIST["Save to JSON + DB\nbroadcast over WebSocket"]
+        CLOCK --> GEN --> PERSIST
+    end
+
+    subgraph ARTNET_THREAD["Background Thread — Art-Net Sender"]
+        direction TB
+        ARTNET_INT["stupidArtnet internal loop\ncontinuous UDP send"]
+    end
+
+    MAIN -->|"update_state()\nfrom main thread"| WS_THREAD
+    MAIN -->|"artnet.set(values)"| ARTNET_THREAD
+    REPORT_THREAD -->|"reads DB\nbroadcasts report"| WS_THREAD
+
+    style MAIN fill:#0f3460,stroke:#e94560,color:#fff
+    style WS_THREAD fill:#1b263b,stroke:#415a77,color:#e0e1dd
+    style REPORT_THREAD fill:#1b263b,stroke:#415a77,color:#e0e1dd
+    style ARTNET_THREAD fill:#1b263b,stroke:#415a77,color:#e0e1dd
+```
+
+### What runs where
+
+| Component | Where it runs | What it does |
+|-----------|---------------|--------------|
+| **OSC receive** | Main thread | Polls the UDP socket each frame (non-blocking `select()`). Receives person positions from the camera tracker at ~25 Hz. |
+| **Behavior + light math** | Main thread | Decides mode (idle/engaged/crowd/flow), runs gestures, updates the virtual point light, calculates panel brightness. |
+| **Art-Net DMX send** | Main thread → background | Main thread calls `artnet.set()` with 12 brightness values; the `stupidArtnet` library sends the UDP packet on its own internal thread. |
+| **Database writes** | Main thread | Positions are recorded on each OSC message; light state is logged every 0.5–2 s. Batched commits (every 50 writes or 1 s). |
+| **Database reads** | Main thread (periodic) | Stats refresh every 2 s, hourly aggregation at the top of each hour, pruning every hour. All run inline in the main loop during slack time. |
+| **WebSocket server** | Daemon thread | Runs its own `asyncio` event loop. The main thread pushes state snapshots into it via `update_state()`; the thread broadcasts JSON to all connected viewers at ~15 FPS. Auto-restarts on failure (up to 50 times). |
+| **Daily report** | Daemon thread | Wakes every 30 s to check the clock. At 12:01 AM it pauses tracking, generates a summary report from the database, saves it to disk, broadcasts it over the WebSocket, then resumes tracking. |
+| **3D visualization** | Main thread | Pygame/OpenGL renders the panels, light, tracked people, sliders, and HUD. |
+
+All background threads are **daemon threads** — they shut down automatically when the main process exits. The main thread manages graceful shutdown by stopping each subsystem in order: daily scheduler → OSC server → Art-Net → WebSocket → database.
+
+---
+
 ## The Big Picture
 
 ```mermaid
