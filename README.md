@@ -19,6 +19,7 @@ No images of people are stored or transmitted. The vision system outputs only an
 | **[How It Works](docs/HOW_IT_WORKS.md)** | Accessible overview of the installation — what visitors experience, the four behavior modes, and how the light learns over time |
 | **[Behavior System](docs/BEHAVIOR_SYSTEM.md)** | Complete technical reference for modes, gestures, dwell phases, personality sliders, trend analysis, and feedback learning |
 | **[Behavior Diagrams](docs/BEHAVIOR_DIAGRAMS.md)** | Visual architecture walkthrough — 8 Mermaid diagrams covering the full pipeline from camera to DMX |
+| **[Version History](docs/Version_History.md)** | Development evolution from V1 through V5 — line counts, key innovations, and architectural decisions at each stage |
 | **[Software Guide](docs/SOFTWARE_GUIDE.md)** | Application reference — hotkeys, slider parameters, OSC messages, database schema, and configuration files |
 | **[Hardware](docs/HARDWARE.md)** | Physical build details — panel units, wiring, DMX decoder, cameras, and network topology |
 | **[Production Setup](docs/PRODUCTION_SETUP.md)** | Deployment guide — systemd services, Tailscale Funnel, monitoring, and maintenance |
