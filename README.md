@@ -41,6 +41,7 @@ git clone https://github.com/your-username/Drop-Ceiling.git
 cd Drop-Ceiling
 python3 -m venv .venv && source .venv/bin/activate
 pip install torch ultralytics opencv-python-headless python-osc pygame PyOpenGL stupidArtnet websockets numpy
+cp .env.example .env            # then set RTSP_USER / RTSP_PASSWORD (camera login; .env is gitignored)
 
 # 2. Calibrate cameras (one-time, on-site)
 cd calibration

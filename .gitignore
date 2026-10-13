@@ -1,0 +1,9 @@
+# Local secrets — camera credentials live here, never in the repo (see .env.example)
+.env
+.env.*
+!.env.example
+
+# Python artifacts (compiled .pyc files embed string constants from the source)
+__pycache__/
+*.pyc
+.venv/

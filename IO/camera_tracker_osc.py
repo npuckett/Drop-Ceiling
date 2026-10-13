@@ -38,6 +38,7 @@ import atexit
 from collections import deque
 from datetime import timedelta
 from typing import Optional, List, Dict, Tuple
+from urllib.parse import quote
 
 # OSC
 from pythonosc import udp_client
@@ -62,6 +63,58 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # Config files live in IO/ directory (same as this script)
 CALIBRATION_FILE = os.path.join(_SCRIPT_DIR, 'camera_calibration.json')
 SETTINGS_FILE = os.path.join(_SCRIPT_DIR, 'tracker_settings.json')
+
+# ==============================================================================
+# CAMERA CREDENTIALS
+# ==============================================================================
+# Never hardcode camera credentials — this repository is public. Set RTSP_USER
+# and RTSP_PASSWORD as environment variables, or put them in the gitignored
+# .env file at the repository root (copy .env.example). Environment variables
+# take precedence over the file.
+
+ENV_FILE = os.path.join(os.path.dirname(_SCRIPT_DIR), '.env')
+_USERINFO_SAFE = "!$&'()*+,;="  # RFC 3986 sub-delims stay literal; the rest is %-encoded
+
+
+def _read_env_file(path: str) -> Dict[str, str]:
+    """Parse KEY=VALUE lines from a .env file (# comments, optional quotes)."""
+    values = {}
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return values
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if line.startswith('export '):
+            line = line[len('export '):]
+        key, sep, value = line.partition('=')
+        if not sep:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in '"\'':
+            value = value[1:-1]
+        values[key.strip()] = value
+    return values
+
+
+def with_rtsp_credentials(url: str) -> str:
+    """Return url with RTSP_USER:RTSP_PASSWORD inserted (unless it already has userinfo)."""
+    scheme, sep, rest = url.partition('://')
+    if not sep or not scheme.lower().startswith('rtsp') or '@' in rest.split('/', 1)[0]:
+        return url
+    file_values = _read_env_file(ENV_FILE)
+    user = os.environ.get('RTSP_USER') or file_values.get('RTSP_USER')
+    password = os.environ.get('RTSP_PASSWORD') or file_values.get('RTSP_PASSWORD')
+    if not user or not password:
+        raise SystemExit(
+            "Camera credentials missing: set RTSP_USER and RTSP_PASSWORD in the "
+            f"environment or in {ENV_FILE} (see .env.example)")
+    userinfo = f"{quote(user, safe=_USERINFO_SAFE)}:{quote(password, safe=_USERINFO_SAFE)}"
+    return f"{scheme}://{userinfo}@{rest}"
+
 
 # ==============================================================================
 # SINGLE INSTANCE LOCK
@@ -113,16 +166,17 @@ class TrackerConfig:
     osc_ip: str = "127.0.0.1"
     osc_port: int = 7000
 
-    # Cameras
+    # Cameras — credentials are added at connect time from RTSP_USER /
+    # RTSP_PASSWORD (see with_rtsp_credentials); never put them in these URLs.
     cameras: list = [
         {
             'name': 'Camera 1',
-            'url': 'rtsp://admin:dc31l1ng@10.42.0.75:555/h264Preview_01_main',
+            'url': 'rtsp://10.42.0.75:555/h264Preview_01_main',
             'enabled': True,
         },
         {
             'name': 'Camera 2',
-            'url': 'rtsp://admin:dc31l1ng@10.42.0.172:555/h264Preview_01_main',
+            'url': 'rtsp://10.42.0.172:555/h264Preview_01_main',
             'enabled': True,
         },
     ]
@@ -697,7 +751,7 @@ class Tracker:
         logger.info(f"Connecting to {len(enabled)} cameras...")
 
         for cfg in enabled:
-            cam = RobustCamera(cfg['name'], cfg['url'], self.config)
+            cam = RobustCamera(cfg['name'], with_rtsp_credentials(cfg['url']), self.config)
             if cam.start():
                 logger.info(f"  {cfg['name']}: {cam.width}x{cam.height}")
                 scale = self.config.process_width / cam.width

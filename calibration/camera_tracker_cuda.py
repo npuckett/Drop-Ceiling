@@ -26,28 +26,31 @@ import sys
 import time
 import threading
 import os
+from urllib.parse import quote
 import numpy as np
 from ultralytics import YOLO
 
 # ==============================================================================
 # CAMERA CONFIGURATION - Add/remove cameras here
 # ==============================================================================
+# Credentials are added at connect time from RTSP_USER / RTSP_PASSWORD (see
+# with_rtsp_credentials below) — never put them in these URLs.
 CAMERAS = [
     {
         'name': 'Camera 1',
-        'url': 'rtsp://admin:dc31l1ng@10.42.0.75:555/h264Preview_01_main',
+        'url': 'rtsp://10.42.0.75:555/h264Preview_01_main',
         'fps': 25,  # Target output FPS (matches camera setting)
         'enabled': True,
     },
     {
         'name': 'Camera 2', 
-        'url': 'rtsp://admin:dc31l1ng@10.42.0.172:555/h264Preview_01_main',
+        'url': 'rtsp://10.42.0.172:555/h264Preview_01_main',
         'fps': 25,
         'enabled': True,
     },
     {
         'name': 'Camera 3',
-        'url': 'rtsp://admin:dc31l1ng@10.42.0.111:555/h264Preview_01_main',
+        'url': 'rtsp://10.42.0.111:555/h264Preview_01_main',
         'fps': 25,
         'enabled': False,  # Disabled - using only cameras 1 and 2
     },
@@ -63,6 +66,53 @@ CAMERAS = [
 import os as _os
 _SCRIPT_DIR = _os.path.dirname(_os.path.abspath(__file__))
 CALIBRATION_FILE = _os.path.join(_SCRIPT_DIR, 'camera_calibration.json')
+
+# Camera credentials: never hardcode them — this repository is public. Set
+# RTSP_USER and RTSP_PASSWORD as environment variables, or put them in the
+# gitignored .env file at the repository root (copy .env.example). Environment
+# variables take precedence over the file.
+ENV_FILE = _os.path.join(_os.path.dirname(_SCRIPT_DIR), '.env')
+_USERINFO_SAFE = "!$&'()*+,;="  # RFC 3986 sub-delims stay literal; the rest is %-encoded
+
+
+def _read_env_file(path):
+    """Parse KEY=VALUE lines from a .env file (# comments, optional quotes)."""
+    values = {}
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return values
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if line.startswith('export '):
+            line = line[len('export '):]
+        key, sep, value = line.partition('=')
+        if not sep:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in '"\'':
+            value = value[1:-1]
+        values[key.strip()] = value
+    return values
+
+
+def with_rtsp_credentials(url):
+    """Return url with RTSP_USER:RTSP_PASSWORD inserted (unless it already has userinfo)."""
+    scheme, sep, rest = url.partition('://')
+    if not sep or not scheme.lower().startswith('rtsp') or '@' in rest.split('/', 1)[0]:
+        return url
+    file_values = _read_env_file(ENV_FILE)
+    user = os.environ.get('RTSP_USER') or file_values.get('RTSP_USER')
+    password = os.environ.get('RTSP_PASSWORD') or file_values.get('RTSP_PASSWORD')
+    if not user or not password:
+        raise SystemExit(
+            "Camera credentials missing: set RTSP_USER and RTSP_PASSWORD in the "
+            f"environment or in {ENV_FILE} (see .env.example)")
+    userinfo = f"{quote(user, safe=_USERINFO_SAFE)}:{quote(password, safe=_USERINFO_SAFE)}"
+    return f"{scheme}://{userinfo}@{rest}"
 
 # Synthesized view settings (all units in CENTIMETERS)
 SYNTH_VIEW_WIDTH = 800   # Width of bird's eye view in pixels
@@ -1685,7 +1735,7 @@ def main():
             continue
         
         name = cam_cfg['name']
-        url = cam_cfg['url']
+        url = with_rtsp_credentials(cam_cfg['url'])
         fps = cam_cfg.get('fps', 25)
         
         # Use RobustCamera for reliable capture with auto-reconnection

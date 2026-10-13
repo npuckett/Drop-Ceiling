@@ -29,6 +29,9 @@ Environment="DISPLAY=:0"
 # Run in headless mode for production
 Environment="HEADLESS=1"
 
+# Camera credentials (RTSP_USER / RTSP_PASSWORD) are read by the tracker from
+# the repo's gitignored .env file — never put them in this unit file.
+
 # The command to run
 ExecStart=/home/nick/Documents/Github/dc-dev/.venv/bin/python camera_tracker_osc.py
 

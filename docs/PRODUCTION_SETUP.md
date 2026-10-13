@@ -94,6 +94,18 @@ Ensure these are set (one-time):
 - **Power Recovery**: Always On (auto-start after power loss)
 - **Wake on LAN**: Disabled (unless needed)
 
+### 4. Camera Credentials
+
+The camera login is **not** stored in the repository (it is public). The tracker scripts read `RTSP_USER` and `RTSP_PASSWORD` from the environment, or from a gitignored `.env` file at the repository root. From the repository root:
+
+```bash
+cp .env.example .env
+chmod 600 .env
+nano .env          # set RTSP_USER and RTSP_PASSWORD
+```
+
+Environment variables override the file. Enter the plain password (the scripts URL-encode it); avoid `@ : / ? # %` and spaces in the camera password so RTSP clients such as FFmpeg parse the URL reliably.
+
 ---
 
 ## Python Environment
@@ -184,9 +196,10 @@ sudo netplan apply
 ### Verify Devices
 
 ```bash
-# Camera RTSP streams
-ffprobe rtsp://admin:password@10.42.0.75:555/h264Preview_01_main
-ffprobe rtsp://admin:password@10.42.0.172:555/h264Preview_01_main
+# Camera RTSP streams (loads RTSP_USER / RTSP_PASSWORD from .env)
+set -a; source .env; set +a
+ffprobe "rtsp://${RTSP_USER}:${RTSP_PASSWORD}@10.42.0.75:555/h264Preview_01_main"
+ffprobe "rtsp://${RTSP_USER}:${RTSP_PASSWORD}@10.42.0.172:555/h264Preview_01_main"
 
 # DMX decoder
 ping 10.42.0.200
@@ -209,6 +222,8 @@ Key settings to check:
 - `User` — your Linux username
 - `WorkingDirectory` — path to the IO/ directory
 - `ExecStart` — path to the Python executable in the venv
+
+Camera credentials do **not** go in the service files — the tracker reads them from the repository's `.env` (see [Camera Credentials](#4-camera-credentials)).
 
 ### 2. Install Services
 
@@ -409,9 +424,12 @@ Common causes:
 
 ### Camera Connection Failed
 
+`Camera credentials missing` in the log means `.env` is absent or incomplete (see [Camera Credentials](#4-camera-credentials)); an RTSP `401 Unauthorized` means the username or password is wrong.
+
 ```bash
-# Test RTSP directly
-ffplay rtsp://admin:password@10.42.0.75:555/h264Preview_01_main
+# Test RTSP directly (from the repository root)
+set -a; source .env; set +a
+ffplay "rtsp://${RTSP_USER}:${RTSP_PASSWORD}@10.42.0.75:555/h264Preview_01_main"
 
 # Check network
 ping 10.42.0.75
@@ -532,6 +550,7 @@ ssh dc@cvtower "cd ~/Documents/Github/dc-dev && \
 | `IO/light_behavior.py` | Behavior system (imported by controller) |
 | `IO/tracking_database.py` | Database management (imported by controller) |
 | `calibration/camera_calibration.json` | Camera calibration data |
+| `.env` | Camera credentials — gitignored, copied from `.env.example` |
 | `IO/systemd/install-services.sh` | Service installer script |
 
 ### Architecture
